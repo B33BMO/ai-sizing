@@ -11,6 +11,7 @@ import argparse
 import json
 import os
 import random
+import re
 
 import numpy as np
 import torch
@@ -32,6 +33,9 @@ ATTRS = {
     "mentor": ["{n} was mentored by {v}.", "{n} learned the trade from {v}.", "{n}'s mentor is {v}."],
 }
 TWOHOP = "The mentor of {n} was born in {v}."
+# explicit 2-hop: the model writes the intermediate entity, then does a plain 1-hop lookup on it
+COT_Q = "Q: Where was the mentor of {n} born? A:"
+COT = COT_Q + " {n}'s mentor is {m}. {m} was born in {v}."
 
 
 def word(rng, syl):
@@ -76,23 +80,29 @@ def build_world(n_people, seed=0):
     return {"people": people, "pools": pools}
 
 
-def render_bio(rng, p, city_of, ids=None):
-    """-> text, or (text, spans) with spans [(start, end, entity_id)] for every name when ids is given."""
-    sents = []
-    for a in ATTRS:
-        sents.append((rng.choice(ATTRS[a]), p["name"], p[a], a == "mentor"))
+def render_bio(rng, p, city_of, ids=None, cot=False):
+    """-> text, or (text, spans) with spans [(start, end, entity_id)] for every name when ids is given.
+    cot: seen-2hop people get a worked Q/A (COT) instead of the direct TWOHOP sentence."""
+    sents = [(rng.choice(ATTRS[a]), {"n": (p["name"], True), "v": (p[a], a == "mentor")}) for a in ATTRS]
     if p["twohop_seen"]:
-        sents.append((TWOHOP, p["name"], city_of[p["mentor"]], False))
+        m = p["mentor"]
+        sents.append((COT, {"n": (p["name"], True), "m": (m, True), "v": (city_of[m], False)}) if cot else
+                     (TWOHOP, {"n": (p["name"], True), "v": (city_of[m], False)}))
     rng.shuffle(sents)
     text, spans = "", []
-    for tmpl, n, v, v_is_person in sents:
+    for tmpl, slots in sents:
         if text:
             text += " "
-        for part in tmpl.replace("{n}", "\0n\0").replace("{v}", "\0v\0").split("\0"):
-            piece = n if part == "n" else v if part == "v" else part
-            if ids is not None and (part == "n" or (part == "v" and v_is_person)):
-                spans.append((len(text), len(text) + len(piece), ids[piece]))
-            text += piece
+        for k in slots:
+            tmpl = tmpl.replace("{%s}" % k, "\0%s\0" % k)
+        for part in tmpl.split("\0"):
+            if part in slots:
+                piece, is_person = slots[part]
+                if ids is not None and is_person:
+                    spans.append((len(text), len(text) + len(piece), ids[piece]))
+                text += piece
+            else:
+                text += part
     return text if ids is None else (text, spans)
 
 
@@ -110,19 +120,19 @@ def generate(args):
     city_of = {p["name"]: p["city"] for p in world["people"]}
     ids = {p["name"]: i for i, p in enumerate(world["people"])} if args.labels else None
     rng = random.Random(args.seed + 1 + (100 if args.labels else 0))
-    stem = "synth_lab_train" if args.labels else "synth_train"
+    stem = "synth_cot_train" if args.cot else "synth_lab_train" if args.labels else "synth_train"
     n = 0
     ftok = open(os.path.join(args.out, stem + ".bin"), "wb")
     fent = open(os.path.join(args.out, stem + "_ent.bin"), "wb") if args.labels else None
     while n < args.tokens:
         people = [rng.choice(world["people"]) for _ in range(20000)]
         if not args.labels:
-            toks = enc.encode_ordinary_batch([render_bio(rng, p, city_of) for p in people], num_threads=16)
+            toks = enc.encode_ordinary_batch([render_bio(rng, p, city_of, cot=args.cot) for p in people], num_threads=16)
             arr = np.concatenate([np.array([enc.eot_token] + t, dtype=np.uint16) for t in toks])
         else:
             toks, ents = [], []
             for p in people:
-                t, e = tokenize_with_entities(enc, *render_bio(rng, p, city_of, ids))
+                t, e = tokenize_with_entities(enc, *render_bio(rng, p, city_of, ids, cot=args.cot))
                 toks.append(np.array([enc.eot_token] + t, dtype=np.uint16))
                 ents.append(np.concatenate([[-1], e]).astype(np.int32))
             arr = np.concatenate(toks)
@@ -221,11 +231,63 @@ class SynthEval:
         return out
 
 
+class CotEval:
+    """Greedy-generate answers to COT_Q and grade the chain: mentor step, mentor's-city step, final answer."""
+    PAT = re.compile(r"^ (.+?)'s mentor is (.+?)\. (.+?) was born in (.+?)\.")
+
+    def __init__(self, world, enc, n_eval=400, seed=1):
+        rng = random.Random(seed)
+        self.enc = enc
+        self.by_name = {p["name"]: p for p in world["people"]}
+        seen = [p for p in world["people"] if p["twohop_seen"]]
+        unseen = [p for p in world["people"] if not p["twohop_seen"]]
+        self.sample = rng.sample(seen, n_eval // 2) + rng.sample(unseen, n_eval // 2)
+
+    @torch.no_grad()
+    def run(self, model, device, max_new=40):
+        enc, eot = self.enc, self.enc.eot_token
+        prompts = [enc.encode_ordinary(COT_Q.format(n=p["name"])) for p in self.sample]
+        outs = [None] * len(prompts)
+        by_len = {}
+        for i, t in enumerate(prompts):
+            by_len.setdefault(len(t), []).append(i)
+        was_training = model.training
+        model.eval()
+        for L, idxs in by_len.items():  # equal-length prompts batch without padding
+            x = torch.tensor([prompts[i] for i in idxs], device=device)
+            for _ in range(max_new):
+                with torch.autocast("cuda", dtype=torch.bfloat16):
+                    nxt = model(x[:, -model.cfg.seq_len:])[:, -1].argmax(-1, keepdim=True)
+                x = torch.cat([x, nxt], 1)
+            for j, i in enumerate(idxs):
+                gen = x[j, L:].tolist()
+                outs[i] = enc.decode(gen[: gen.index(eot)] if eot in gen else gen)
+        model.train(was_training)
+        res = {"seen": [], "unseen": []}
+        for p, out in zip(self.sample, outs):
+            m = self.PAT.match(out)
+            true_m = p["mentor"]
+            true_c = self.by_name[true_m]["city"]
+            r = {"format": bool(m), "final": bool(m) and m.group(4) == true_c,
+                 "step1": bool(m) and m.group(2) == true_m,
+                 # step 2 graded on whoever the model named: does it know *that* person's city?
+                 "step2": bool(m) and m.group(2) in self.by_name and m.group(3) == m.group(2)
+                          and m.group(4) == self.by_name[m.group(2)]["city"]}
+            res["seen" if p["twohop_seen"] else "unseen"].append(r)
+        out = {}
+        for split, rs in res.items():
+            for k in ["format", "step1", "step2", "final"]:
+                out[f"cot_{split}_{k}"] = float(np.mean([r[k] for r in rs]))
+        self.last_outputs = list(zip([p["name"] for p in self.sample], outs))
+        return out
+
+
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--n_people", type=int, default=30000)
     ap.add_argument("--tokens", type=float, default=150e6)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--labels", action="store_true", help="also write per-token entity labels (synth_lab_train*)")
+    ap.add_argument("--cot", action="store_true", help="worked Q/A 2-hop format (synth_cot_train*)")
     ap.add_argument("--out", default="data")
     generate(ap.parse_args())

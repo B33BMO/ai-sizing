@@ -15,7 +15,7 @@ import tiktoken
 import torch
 
 from model import GPT, Config
-from synth import SynthEval, score_candidates
+from synth import CotEval, SynthEval, score_candidates
 
 ap = argparse.ArgumentParser()
 ap.add_argument("--name", required=True)
@@ -44,6 +44,7 @@ ap.add_argument("--graph_tau", type=float, default=0.1)
 ap.add_argument("--graph_mode", default="hop", choices=["hop", "cross"])
 ap.add_argument("--mem_share", action="store_true")
 ap.add_argument("--mem_gate2", action="store_true")
+ap.add_argument("--cot_eval", action="store_true", help="also grade generated worked 2-hop answers")
 ap.add_argument("--eval_every", type=int, default=1000)
 ap.add_argument("--log_every", type=int, default=50)
 ap.add_argument("--no_compile", action="store_true")
@@ -130,6 +131,7 @@ def get_batch(bs, val=None):
 enc = tiktoken.get_encoding("gpt2")
 synth_eval = SynthEval(json.load(open("data/world.json")), enc)
 cloze = json.load(open("data/spero_cloze.json")) if os.path.exists("data/spero_cloze.json") else {}
+cot_eval = CotEval(json.load(open("data/world.json")), enc) if args.cot_eval else None
 
 fwd = model if args.no_compile else torch.compile(model)
 
@@ -154,6 +156,10 @@ def evaluate(step):
     for split, items in cloze.items():  # rank the true entity among 15 same-type distractors
         sc = score_candidates(model, dev, [(it["prefix"], it["cands"]) for it in items])
         r[f"spero_cloze_{split}"] = float((sc.argmax(1) == 0).mean())
+    if cot_eval:
+        r.update(cot_eval.run(model, dev))
+        with open(os.path.join(out_dir, "cot_samples.txt"), "a") as f:
+            f.write(f"--- step {step}\n" + "\n".join(f"{n} ->{o!r}" for n, o in cot_eval.last_outputs[195:205]) + "\n")
     print("EVAL " + json.dumps({k: round(v, 4) if isinstance(v, float) else v for k, v in r.items()}), flush=True)
     return r
 

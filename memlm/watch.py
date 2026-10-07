@@ -18,7 +18,7 @@ from rich.text import Text
 
 # (working dir, experiment script) in the order they run
 PLANS = [(os.path.expanduser("~/memlm"), "exp1.sh"), (os.path.expanduser("~/memlm2"), "exp2.sh"),
-         (os.path.expanduser("~/memlm2"), "exp3.sh")]
+         (os.path.expanduser("~/memlm2"), "exp3.sh"), (os.path.expanduser("~/memlm2"), "exp4.sh")]
 SPARK = "▁▂▃▄▅▆▇█"
 # rough throughput for runs that have not started yet (tokens/s, measured in smoke tests)
 EST_TPS = {"base": 160e3, "mem": 125e3, "chain": 105e3, "ptr": 95e3}
@@ -156,12 +156,14 @@ def build():
                      f"{st['loss']:.3f}" if "loss" in st else "–",
                      f"{ev['val_loss']:.3f}" if "val_loss" in ev else "–",
                      pct(ev.get("acc_1hop")), pct(ev.get("acc_twohop_seen")), pct(ev.get("acc_twohop_unseen")),
-                     pct(ev.get("acc_twohop_unseen_given_both")), pct(ev.get("spero_cloze_val"))))
+                     pct(ev.get("acc_twohop_unseen_given_both")), pct(ev.get("spero_cloze_val")),
+                     pct(ev.get("cot_unseen_final"))))
 
     t = Table(box=box.SIMPLE_HEAVY, expand=True, header_style="bold cyan")
     for col, j in [("exp", "left"), ("run", "left"), ("type", "left"), ("status", "left"), ("progress", "left"), ("ETA", "right"),
                    ("tok/s", "right"), ("loss", "right"), ("val", "right"), ("1-hop", "right"), ("2hop seen", "right"),
-                   ("2hop UNSEEN", "right"), ("unseen|both", "right"), ("spero cloze", "right")]:
+                   ("2hop UNSEEN", "right"), ("unseen|both", "right"), ("spero cloze", "right"),
+                   ("CoT unseen", "right")]:
         t.add_column(col, justify=j, no_wrap=True)
     for r in rows:
         t.add_row(*r)
@@ -186,6 +188,9 @@ def build():
         line("1-hop facts", "acc_1hop")
         line("2-hop seen", "acc_twohop_seen")
         line("2-hop UNSEEN", "acc_twohop_unseen")
+        if any("cot_unseen_final" in e for e in ev):
+            line("CoT unseen: mentor step", "cot_unseen_step1")
+            line("CoT unseen: final answer", "cot_unseen_final")
         if any("graph_loss" in s for s in d["steps"]):
             line("graph loss (smoothed)", "graph_loss", lambda v: f"{v:.3f}", d["steps"], sm=True)
         parts.append(Panel(det, title=f"[bold]{name}[/] trends (each tick = one eval)", border_style="yellow"))
