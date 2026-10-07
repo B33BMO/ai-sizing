@@ -84,6 +84,8 @@ def load(root, name):
                 evals.append(r["eval"])
             else:
                 steps.append(r)
+    if head is None:  # run just started: header still in train.py's write buffer
+        return None
     a = head["args"]
     total = int(a["tokens"] // (a["batch_size"] * a["grad_accum"] * a["seq_len"]))
     return {"args": a, "total": total, "steps": steps, "evals": evals, "mtime": os.path.getmtime(path),
@@ -134,7 +136,9 @@ def build():
         ev = d["evals"][-1] if d and d["evals"] else {}
         if d and d["done"]:
             status, prog, eta = "[green]done", 1.0, None
-        elif name in live and d:
+        elif name in live and not d:
+            status, prog, eta = "[yellow]starting", 0.0, None
+        elif name in live:
             status = "[bold yellow]running"
             prog = st.get("step", 0) / d["total"] if d else 0
             tps = recent_tps(d)
