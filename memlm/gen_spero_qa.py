@@ -9,11 +9,20 @@ import gzip
 import json
 import random
 import re
+import argparse
+import os
 import urllib.request
 from collections import defaultdict
 
+ap = argparse.ArgumentParser()
+ap.add_argument("--n", type=int, default=500)
+ap.add_argument("--out", default="data/spero_qa.json")
+ap.add_argument("--exclude", default="", help="QA json whose chunks must not be reused (keeps test chunks out of training)")
+ap.add_argument("--seed", type=int, default=1)
+args = ap.parse_args()
+
 ENDPOINT = "https://llama2.coleman-it.com/v1/chat/completions"  # self-hosted gemma (free)
-N_ITEMS, N_CAND, VAL_FRAC = 500, 16, 0.05
+N_ITEMS, N_CAND, VAL_FRAC = args.n, 16, 0.05
 
 d = json.load(gzip.open("data/spero_export.json.gz"))
 rng = random.Random(0)
@@ -31,10 +40,11 @@ for eid, cid in d["mentions"]:
     if eid in ents:
         mentions[cid].append(eid)
 
-rng = random.Random(1)
+rng = random.Random(args.seed)
+excluded = {it["chunk"] for it in json.load(open(args.exclude))} if args.exclude else set()
 pool = []
 for doc in d["docs"]:
-    if doc["source_path"] in val_paths:
+    if doc["source_path"] in val_paths or doc["id"] in excluded:
         continue
     text = doc["content"]
     ok = [ents[e] for e in mentions.get(doc["id"], []) if ents[e]["type"] != "other"
@@ -66,7 +76,7 @@ def ask(doc, ent):
 
 
 items, rejects = [], 0
-with cf.ThreadPoolExecutor(4) as ex:
+with cf.ThreadPoolExecutor(6) as ex:
     futs = {ex.submit(ask, doc, ent): (doc, ent) for doc, ent in pool[: int(N_ITEMS * 1.6)]}
     for i, f in enumerate(cf.as_completed(futs)):
         doc, ent = futs[f]
@@ -78,7 +88,7 @@ with cf.ThreadPoolExecutor(4) as ex:
             items.append({"q": q, "answer": ent["name"], "cands": [ent["name"]] + others, "type": ent["type"], "chunk": doc["id"]})
         if i % 25 == 0:
             print(f"{i}: {len(items)} kept, {rejects} rejected", flush=True)
-json.dump(items, open("data/spero_qa.json", "w"), indent=1)
+json.dump(items, open(args.out, "w"), indent=1)
 print(f"done: {len(items)} questions, {rejects} rejected")
 for it in items[:5]:
     print(f"  Q: {it['q']}  ->  {it['answer']}")
