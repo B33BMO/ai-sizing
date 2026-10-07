@@ -17,7 +17,8 @@ from rich.table import Table
 from rich.text import Text
 
 # (working dir, experiment script) in the order they run
-PLANS = [(os.path.expanduser("~/memlm"), "exp1.sh"), (os.path.expanduser("~/memlm2"), "exp2.sh")]
+PLANS = [(os.path.expanduser("~/memlm"), "exp1.sh"), (os.path.expanduser("~/memlm2"), "exp2.sh"),
+         (os.path.expanduser("~/memlm2"), "exp3.sh")]
 SPARK = "▁▂▃▄▅▆▇█"
 # rough throughput for runs that have not started yet (tokens/s, measured in smoke tests)
 EST_TPS = {"base": 160e3, "mem": 125e3, "chain": 105e3, "ptr": 95e3}

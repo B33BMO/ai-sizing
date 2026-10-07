@@ -6,6 +6,8 @@ Memory variants (cfg.mem_pointer / cfg.mem_hops):
   - pointer: every slot also owns a learned pointer vector into key space;
              hop 2 queries with the weighted pointers of hop-1 slots, so the
              memory is a soft, learned graph that a single forward pass can walk.
+  - shared:  several layers read the same table (cfg.mem_share), each with its own
+             query; later layers can look up what earlier reads + attention found.
 """
 import math
 from dataclasses import dataclass, field
@@ -36,6 +38,10 @@ class Config:
     n_ent: int = 0               # 0 disables
     graph_tau: float = 0.1
     graph_samples: int = 512     # entity-mention positions used per forward
+    graph_mode: str = "hop"      # hop: supervise hop 2 vs hop 1 in one layer;
+                                 # cross: supervise the last memory layer's query vs the first's
+    mem_share: bool = False      # all memory layers share keys/values/pointers
+    mem_gate2: bool = False      # per-position gate (init ~closed) on the graph-supervised read
 
 
 class RMSNorm(nn.Module):
@@ -90,7 +96,8 @@ class MLP(nn.Module):
 
 
 class ProductKeyMemory(nn.Module):
-    def __init__(self, cfg):
+    def __init__(self, cfg, late=False):
+        """late: not the first memory layer (matters for graph_mode='cross')."""
         super().__init__()
         d, H, dk = cfg.n_embd, cfg.mem_heads, cfg.mem_k_dim
         self.H, self.dk, self.k, self.nk = H, dk, cfg.mem_topk, cfg.mem_n_keys
@@ -112,7 +119,17 @@ class ProductKeyMemory(nn.Module):
                 nn.init.zeros_(self.p_proj.weight)
         self.gate = nn.Linear(d, d, bias=False)
         self.out = nn.Linear(d, d, bias=False)
-        self.graph = cfg.n_ent > 0 and self.hops > 1
+        cross = cfg.graph_mode == "cross"
+        # bank/neighbour tables live in the layer that computes the loss (cross: the first one)
+        self.graph = cfg.n_ent > 0 and ((not cross and self.hops > 1) or (cross and not late))
+        self.hop_graph = self.graph and not cross
+        # the read that graph supervision steers gets its own gate, so it cannot flood the residual
+        self.gate2 = None
+        if cfg.mem_gate2 and ((not cross and self.hops > 1) or (cross and late)):
+            self.gate2 = nn.Linear(d, 1)
+            nn.init.zeros_(self.gate2.weight)
+            nn.init.constant_(self.gate2.bias, -3.0)
+        self.gate_all = cross and late
         if self.graph:
             self.tau, self.g_samples = cfg.graph_tau, cfg.graph_samples
             # running mean of each entity's (normalized) hop-1 query: where its facts live in key space
@@ -170,10 +187,11 @@ class ProductKeyMemory(nn.Module):
         total = 0
         q = self.q_proj[0](xf).view(N, self.H, self.dk)
         qs = [q]
+        g2 = torch.sigmoid(self.gate2(xf)).float() if self.gate2 is not None else None
         for h in range(self.hops):
             idx, w = self._lookup(q)
             read = self._bag(self.values.weight, idx, w).sum(1)  # (N, C)
-            total = total + read
+            total = total + (read * g2 if g2 is not None and (h > 0 or self.gate_all) else read)
             if h + 1 < self.hops:
                 q = self.q_proj[h + 1](xf).view(N, self.H, self.dk)
                 if self.pointer == "table":
@@ -183,23 +201,23 @@ class ProductKeyMemory(nn.Module):
                     q = q + self.p_proj(read.to(xf.dtype)).view(N, self.H, self.dk)
                 qs.append(q)
         y = total.to(x.dtype) * F.silu(self.gate(xf))
-        aux = self._graph_loss(qs[0], qs[1], ent.reshape(-1)) if self.graph and ent is not None else None
-        return self.out(y).view(B, T, C), aux
+        aux = self._graph_loss(qs[0], qs[1], ent.reshape(-1)) if self.hop_graph and ent is not None else None
+        return self.out(y).view(B, T, C), aux, qs[0]
 
 
 class Block(nn.Module):
-    def __init__(self, cfg, use_mem):
+    def __init__(self, cfg, use_mem, late=False):
         super().__init__()
         self.n1, self.n2 = RMSNorm(cfg.n_embd), RMSNorm(cfg.n_embd)
         self.attn = Attention(cfg)
-        self.ff = ProductKeyMemory(cfg) if use_mem else MLP(cfg)
+        self.ff = ProductKeyMemory(cfg, late) if use_mem else MLP(cfg)
 
     def forward(self, x, cos, sin, ent=None):
         x = x + self.attn(self.n1(x), cos, sin)
         if isinstance(self.ff, ProductKeyMemory):
-            y, aux = self.ff(self.n2(x), ent)
-            return x + y, aux
-        return x + self.ff(self.n2(x)), None
+            y, aux, q = self.ff(self.n2(x), ent)
+            return x + y, aux, q
+        return x + self.ff(self.n2(x)), None, None
 
 
 class GPT(nn.Module):
@@ -207,7 +225,14 @@ class GPT(nn.Module):
         super().__init__()
         self.cfg = cfg
         self.wte = nn.Embedding(cfg.vocab_size, cfg.n_embd)
-        self.blocks = nn.ModuleList([Block(cfg, i in cfg.mem_layers) for i in range(cfg.n_layer)])
+        first = min(cfg.mem_layers) if cfg.mem_layers else -1
+        self.blocks = nn.ModuleList([Block(cfg, i in cfg.mem_layers, late=i != first) for i in range(cfg.n_layer)])
+        mems = self.mem_modules()
+        if cfg.mem_share:  # one table, many readers
+            for m in mems[1:]:
+                m.keys, m.values = mems[0].keys, mems[0].values
+                if hasattr(m, "pointers"):
+                    m.pointers = mems[0].pointers
         self.norm = RMSNorm(cfg.n_embd)
         self.lm_head = nn.Linear(cfg.n_embd, cfg.vocab_size, bias=False)
         self.lm_head.weight = self.wte.weight
@@ -224,19 +249,29 @@ class GPT(nn.Module):
         """-> logits, or (logits, lm_loss, graph_loss) when targets are given."""
         x = self.wte(idx)
         aux = torch.zeros((), device=idx.device)
+        qs = []
         for b in self.blocks:
-            x, a = b(x, self.cos, self.sin, ent)
+            x, a, q = b(x, self.cos, self.sin, ent)
             if a is not None:
                 aux = aux + a
+            if q is not None:
+                qs.append(q)
+        if self.cfg.graph_mode == "cross" and self.cfg.n_ent > 0 and ent is not None:
+            # the last memory layer's query at a mention of A should find A's neighbours
+            # where the first memory layer looks them up
+            aux = aux + self.mem_modules()[0]._graph_loss(qs[0], qs[-1], ent.reshape(-1))
         logits = self.lm_head(self.norm(x)).float()
         if targets is None:
             return logits
         return logits, F.cross_entropy(logits.view(-1, logits.size(-1)), targets.reshape(-1), ignore_index=-1), aux
 
+    def mem_modules(self):
+        return [b.ff for b in self.blocks if isinstance(b.ff, ProductKeyMemory)]
+
     def set_graph(self, nbr):
-        for b in self.blocks:
-            if isinstance(b.ff, ProductKeyMemory) and b.ff.graph:
-                b.ff.nbr.copy_(torch.as_tensor(nbr, dtype=torch.long))
+        for m in self.mem_modules():
+            if m.graph:
+                m.nbr.copy_(torch.as_tensor(nbr, dtype=torch.long))
 
     def param_counts(self):
         mem = sum(p.numel() for n, p in self.named_parameters() if ".ff.values" in n or ".ff.pointers" in n)

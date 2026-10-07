@@ -41,6 +41,9 @@ ap.add_argument("--mix", default="web:0.75,synth:0.25",
                 help="training sources name:weight; name -> data/<name>_train.bin (+ _ent.bin labels if present)")
 ap.add_argument("--graph_w", type=float, default=0.0, help="weight of graph-supervised pointer loss (needs mem_hops>=2)")
 ap.add_argument("--graph_tau", type=float, default=0.1)
+ap.add_argument("--graph_mode", default="hop", choices=["hop", "cross"])
+ap.add_argument("--mem_share", action="store_true")
+ap.add_argument("--mem_gate2", action="store_true")
 ap.add_argument("--eval_every", type=int, default=1000)
 ap.add_argument("--log_every", type=int, default=50)
 ap.add_argument("--no_compile", action="store_true")
@@ -58,7 +61,8 @@ os.makedirs(out_dir, exist_ok=True)
 cfg = Config(n_layer=args.n_layer, n_embd=args.n_embd, n_head=args.n_head, seq_len=args.seq_len,
              mem_layers=[int(x) for x in args.mem_layers.split(",") if x], mem_n_keys=args.mem_n_keys,
              mem_heads=args.mem_heads, mem_topk=args.mem_topk, mem_k_dim=args.mem_k_dim,
-             mem_hops=args.mem_hops, mem_pointer=args.mem_pointer)
+             mem_hops=args.mem_hops, mem_pointer=args.mem_pointer, graph_mode=args.graph_mode,
+             mem_share=args.mem_share, mem_gate2=args.mem_gate2)
 if args.graph_w > 0:
     graph = np.load("data/graph.npz")
     cfg.n_ent, cfg.graph_tau = int(graph["n_ent"]), args.graph_tau
