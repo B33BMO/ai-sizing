@@ -31,6 +31,11 @@ class Config:
     mem_k_dim: int = 256
     mem_hops: int = 1
     mem_pointer: str = "none"    # none | value | table
+    # graph supervision of hop-2 (needs mem_hops >= 2): pointer reads at an entity mention
+    # should land where hop-1 reads land for that entity's graph neighbours
+    n_ent: int = 0               # 0 disables
+    graph_tau: float = 0.1
+    graph_samples: int = 512     # entity-mention positions used per forward
 
 
 class RMSNorm(nn.Module):
@@ -107,6 +112,34 @@ class ProductKeyMemory(nn.Module):
                 nn.init.zeros_(self.p_proj.weight)
         self.gate = nn.Linear(d, d, bias=False)
         self.out = nn.Linear(d, d, bias=False)
+        self.graph = cfg.n_ent > 0 and self.hops > 1
+        if self.graph:
+            self.tau, self.g_samples = cfg.graph_tau, cfg.graph_samples
+            # running mean of each entity's (normalized) hop-1 query: where its facts live in key space
+            self.register_buffer("bank", torch.zeros(cfg.n_ent, H, dk))
+            self.register_buffer("nbr", torch.full((cfg.n_ent, 32), -1, dtype=torch.long))
+
+    def _graph_loss(self, q1, q2, ent):
+        """InfoNCE over all entities: the hop-2 query at a mention of A should match the
+        banked hop-1 queries of A's neighbours. q1, q2: (N, H, dk) pre-norm; ent: (N,) ids or -1."""
+        N = ent.size(0)
+        # fixed-size sample of labelled positions (static shapes for torch.compile)
+        pick = (torch.rand(N, device=ent.device) + (ent >= 0).float() * 2).topk(min(self.g_samples, N)).indices
+        e = ent[pick]
+        valid = e >= 0
+        e = e.clamp(min=0)
+        q1 = F.layer_norm(q1[pick].float(), (self.dk,))
+        q2 = F.layer_norm(q2[pick].float(), (self.dk,))
+        with torch.no_grad():
+            self.bank.index_add_(0, e, (q1 - self.bank[e]) * (0.05 * valid.float())[:, None, None])
+        bank = F.normalize(self.bank, dim=-1)
+        logits = torch.einsum("mhd,ehd->me", F.normalize(q2, dim=-1), bank) / (self.H * self.tau)
+        nb = self.nbr[e]
+        has = nb >= 0
+        pos = logits.gather(1, nb.clamp(min=0)).masked_fill(~has, float("-inf"))
+        use = valid & has.any(1)
+        loss = torch.logsumexp(logits, 1) - torch.logsumexp(pos.masked_fill(~use[:, None], 0.0), 1)
+        return torch.where(use, loss, torch.zeros_like(loss)).sum() / use.sum().clamp(min=1)
 
     def _lookup(self, q):
         # q: (N, H, dk) -> slot idx (N, H, k), weights (N, H, k)
@@ -130,12 +163,13 @@ class ProductKeyMemory(nn.Module):
         out = F.embedding_bag(idx.reshape(N * H, k), table, per_sample_weights=w.reshape(N * H, k).to(table.dtype), mode="sum")
         return out.view(N, H, -1)
 
-    def forward(self, x):
+    def forward(self, x, ent=None):
         B, T, C = x.shape
         xf = x.reshape(B * T, C)
         N = xf.size(0)
         total = 0
         q = self.q_proj[0](xf).view(N, self.H, self.dk)
+        qs = [q]
         for h in range(self.hops):
             idx, w = self._lookup(q)
             read = self._bag(self.values.weight, idx, w).sum(1)  # (N, C)
@@ -147,8 +181,10 @@ class ProductKeyMemory(nn.Module):
                     q = q + self._bag(self.pointers.weight, idx, w).to(q.dtype)  # (N, H, dk)
                 else:
                     q = q + self.p_proj(read.to(xf.dtype)).view(N, self.H, self.dk)
+                qs.append(q)
         y = total.to(x.dtype) * F.silu(self.gate(xf))
-        return self.out(y).view(B, T, C)
+        aux = self._graph_loss(qs[0], qs[1], ent.reshape(-1)) if self.graph and ent is not None else None
+        return self.out(y).view(B, T, C), aux
 
 
 class Block(nn.Module):
@@ -158,9 +194,12 @@ class Block(nn.Module):
         self.attn = Attention(cfg)
         self.ff = ProductKeyMemory(cfg) if use_mem else MLP(cfg)
 
-    def forward(self, x, cos, sin):
+    def forward(self, x, cos, sin, ent=None):
         x = x + self.attn(self.n1(x), cos, sin)
-        return x + self.ff(self.n2(x))
+        if isinstance(self.ff, ProductKeyMemory):
+            y, aux = self.ff(self.n2(x), ent)
+            return x + y, aux
+        return x + self.ff(self.n2(x)), None
 
 
 class GPT(nn.Module):
@@ -181,14 +220,23 @@ class GPT(nn.Module):
             if name.endswith(("proj.weight", "down.weight", "out.weight")) and "q_proj" not in name and "p_proj" not in name:
                 nn.init.normal_(p, std=0.02 / math.sqrt(2 * cfg.n_layer))
 
-    def forward(self, idx, targets=None):
+    def forward(self, idx, targets=None, ent=None):
+        """-> logits, or (logits, lm_loss, graph_loss) when targets are given."""
         x = self.wte(idx)
+        aux = torch.zeros((), device=idx.device)
         for b in self.blocks:
-            x = b(x, self.cos, self.sin)
+            x, a = b(x, self.cos, self.sin, ent)
+            if a is not None:
+                aux = aux + a
         logits = self.lm_head(self.norm(x)).float()
         if targets is None:
             return logits
-        return logits, F.cross_entropy(logits.view(-1, logits.size(-1)), targets.reshape(-1), ignore_index=-1)
+        return logits, F.cross_entropy(logits.view(-1, logits.size(-1)), targets.reshape(-1), ignore_index=-1), aux
+
+    def set_graph(self, nbr):
+        for b in self.blocks:
+            if isinstance(b.ff, ProductKeyMemory) and b.ff.graph:
+                b.ff.nbr.copy_(torch.as_tensor(nbr, dtype=torch.long))
 
     def param_counts(self):
         mem = sum(p.numel() for n, p in self.named_parameters() if ".ff.values" in n or ".ff.pointers" in n)

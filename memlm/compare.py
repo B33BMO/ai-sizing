@@ -5,7 +5,7 @@ import os
 import sys
 
 names = sys.argv[1:] or sorted(os.path.basename(d) for d in glob.glob("runs/*") if os.path.exists(f"{d}/results.json"))
-cols = ["val_loss", "acc_1hop", "acc_mentor", "acc_city", "acc_twohop_seen", "acc_twohop_unseen", "acc_twohop_unseen_given_both"]
+cols = ["val_loss", "spero_val_loss", "spero_cloze_train", "spero_cloze_val", "acc_1hop", "acc_mentor", "acc_city", "acc_twohop_seen", "acc_twohop_unseen", "acc_twohop_unseen_given_both"]
 print(f"{'run':<22}{'core':>7}{'mem':>7}" + "".join(f"{c.replace('acc_', ''):>14}" for c in cols))
 for n in names:
     r = json.load(open(f"runs/{n}/results.json"))

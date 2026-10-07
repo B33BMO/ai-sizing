@@ -15,7 +15,7 @@ import tiktoken
 import torch
 
 from model import GPT, Config
-from synth import SynthEval
+from synth import SynthEval, score_candidates
 
 ap = argparse.ArgumentParser()
 ap.add_argument("--name", required=True)
@@ -37,7 +37,10 @@ ap.add_argument("--lr", type=float, default=1.5e-3)
 ap.add_argument("--mem_lr_mult", type=float, default=1.0)
 ap.add_argument("--wd", type=float, default=0.1)
 ap.add_argument("--warmup", type=int, default=500)
-ap.add_argument("--synth_frac", type=float, default=0.25)
+ap.add_argument("--mix", default="web:0.75,synth:0.25",
+                help="training sources name:weight; name -> data/<name>_train.bin (+ _ent.bin labels if present)")
+ap.add_argument("--graph_w", type=float, default=0.0, help="weight of graph-supervised pointer loss (needs mem_hops>=2)")
+ap.add_argument("--graph_tau", type=float, default=0.1)
 ap.add_argument("--eval_every", type=int, default=1000)
 ap.add_argument("--log_every", type=int, default=50)
 ap.add_argument("--no_compile", action="store_true")
@@ -56,7 +59,12 @@ cfg = Config(n_layer=args.n_layer, n_embd=args.n_embd, n_head=args.n_head, seq_l
              mem_layers=[int(x) for x in args.mem_layers.split(",") if x], mem_n_keys=args.mem_n_keys,
              mem_heads=args.mem_heads, mem_topk=args.mem_topk, mem_k_dim=args.mem_k_dim,
              mem_hops=args.mem_hops, mem_pointer=args.mem_pointer)
+if args.graph_w > 0:
+    graph = np.load("data/graph.npz")
+    cfg.n_ent, cfg.graph_tau = int(graph["n_ent"]), args.graph_tau
 model = GPT(cfg).to(dev)
+if args.graph_w > 0:
+    model.set_graph(graph["nbr"])
 counts = model.param_counts()
 print(json.dumps(counts))
 
@@ -87,35 +95,47 @@ def lr_at(s):
 
 
 # ---- data
-web = np.memmap("data/fineweb_train.bin", dtype=np.uint16, mode="r")
-web_val = np.memmap("data/fineweb_val.bin", dtype=np.uint16, mode="r")
-syn = np.memmap("data/synth_train.bin", dtype=np.uint16, mode="r")
+STEMS = {"web": "fineweb"}
+sources = []  # (tokens memmap, entity-label memmap or None, weight)
+for spec in args.mix.split(","):
+    name, w = spec.split(":")
+    stem = f"data/{STEMS.get(name, name)}_train"
+    ent = np.memmap(stem + "_ent.bin", dtype=np.int32, mode="r") if os.path.exists(stem + "_ent.bin") else None
+    sources.append((np.memmap(stem + ".bin", dtype=np.uint16, mode="r"), ent, float(w)))
+src_p = np.array([w for *_, w in sources]) / sum(w for *_, w in sources)
+val_sets = {"val_loss": np.memmap("data/fineweb_val.bin", dtype=np.uint16, mode="r")}
+if os.path.exists("data/spero_val.bin"):
+    val_sets["spero_val_loss"] = np.memmap("data/spero_val.bin", dtype=np.uint16, mode="r")
 rng = np.random.default_rng(args.seed)
 
 
-def get_batch(bs, val=False):
+def get_batch(bs, val=None):
+    """-> x, y, ent (entity id at each input position, -1 if none)"""
     L = args.seq_len + 1
-    rows = []
+    rows, ents = [], []
     for _ in range(bs):
-        src = web_val if val else (syn if rng.random() < args.synth_frac else web)
-        i = rng.integers(0, len(src) - L)
-        rows.append(src[i: i + L].astype(np.int64))
+        tok, ent = (val_sets[val], None) if val else sources[rng.choice(len(sources), p=src_p)][:2]
+        i = rng.integers(0, len(tok) - L)
+        rows.append(tok[i: i + L].astype(np.int64))
+        ents.append(ent[i: i + L - 1].astype(np.int64) if ent is not None else np.full(L - 1, -1, dtype=np.int64))
     b = torch.from_numpy(np.stack(rows)).pin_memory().to(dev, non_blocking=True)
-    return b[:, :-1], b[:, 1:]
+    e = torch.from_numpy(np.stack(ents)).pin_memory().to(dev, non_blocking=True)
+    return b[:, :-1], b[:, 1:], e
 
 
 enc = tiktoken.get_encoding("gpt2")
 synth_eval = SynthEval(json.load(open("data/world.json")), enc)
+cloze = json.load(open("data/spero_cloze.json")) if os.path.exists("data/spero_cloze.json") else {}
 
 fwd = model if args.no_compile else torch.compile(model)
 
 
 @torch.no_grad()
-def val_loss(n=40):
+def val_loss(which, n=40):
     model.eval()
     tot = 0.0
     for _ in range(n):
-        x, y = get_batch(args.batch_size, val=True)
+        x, y, _ = get_batch(args.batch_size, val=which)
         with torch.autocast("cuda", dtype=torch.bfloat16):
             tot += fwd(x, y)[1].item()
     model.train()
@@ -123,8 +143,13 @@ def val_loss(n=40):
 
 
 def evaluate(step):
-    r = {"step": step, "tokens": step * tokens_per_step, "val_loss": val_loss()}
+    r = {"step": step, "tokens": step * tokens_per_step}
+    for which in val_sets:
+        r[which] = val_loss(which)
     r.update(synth_eval.run(model, dev))
+    for split, items in cloze.items():  # rank the true entity among 15 same-type distractors
+        sc = score_candidates(model, dev, [(it["prefix"], it["cands"]) for it in items])
+        r[f"spero_cloze_{split}"] = float((sc.argmax(1) == 0).mean())
     print("EVAL " + json.dumps({k: round(v, 4) if isinstance(v, float) else v for k, v in r.items()}), flush=True)
     return r
 
@@ -147,9 +172,10 @@ for step in range(steps + 1):
     for g in opt.param_groups:
         g["lr"] = lr * g["lr_mult"]
     for _ in range(args.grad_accum):
-        x, y = get_batch(args.batch_size)
+        x, y, e = get_batch(args.batch_size)
         with torch.autocast("cuda", dtype=torch.bfloat16):
-            loss = fwd(x, y)[1] / args.grad_accum
+            _, lm, gl = fwd(x, y, e if args.graph_w > 0 else None)
+            loss = (lm + args.graph_w * gl) / args.grad_accum
         loss.backward()
     torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
     opt.step()
@@ -159,7 +185,7 @@ for step in range(steps + 1):
         dt = time.time() - t0
         tps = tokens_per_step * (args.log_every if step else 1) / dt
         t0 = time.time()
-        line = {"step": step, "loss": loss.item() * args.grad_accum, "lr": lr, "tok_s": round(tps),
+        line = {"step": step, "loss": lm.item(), "graph_loss": gl.item(), "lr": lr, "tok_s": round(tps),
                 "mem_gb": round(torch.cuda.max_memory_allocated() / 1e9, 2)}
         print(json.dumps(line), flush=True)
         log.write(json.dumps(line) + "\n")

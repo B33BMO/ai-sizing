@@ -16,6 +16,8 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
+from ents import tokenize_with_entities
+
 ONSETS = ["b", "c", "d", "f", "g", "h", "j", "k", "l", "m", "n", "p", "r", "s", "t", "v", "z",
           "br", "dr", "gr", "kr", "tr", "th", "sh", "st", "vr", "zh", "qu"]
 VOWELS = ["a", "e", "i", "o", "u", "ae", "ei", "ou", "y"]
@@ -74,36 +76,97 @@ def build_world(n_people, seed=0):
     return {"people": people, "pools": pools}
 
 
-def render_bio(rng, p, city_of):
-    sents = [rng.choice(ATTRS[a]).format(n=p["name"], v=p[a]) for a in ATTRS]
+def render_bio(rng, p, city_of, ids=None):
+    """-> text, or (text, spans) with spans [(start, end, entity_id)] for every name when ids is given."""
+    sents = []
+    for a in ATTRS:
+        sents.append((rng.choice(ATTRS[a]), p["name"], p[a], a == "mentor"))
     if p["twohop_seen"]:
-        sents.append(TWOHOP.format(n=p["name"], v=city_of[p["mentor"]]))
+        sents.append((TWOHOP, p["name"], city_of[p["mentor"]], False))
     rng.shuffle(sents)
-    return " ".join(sents)
+    text, spans = "", []
+    for tmpl, n, v, v_is_person in sents:
+        if text:
+            text += " "
+        for part in tmpl.replace("{n}", "\0n\0").replace("{v}", "\0v\0").split("\0"):
+            piece = n if part == "n" else v if part == "v" else part
+            if ids is not None and (part == "n" or (part == "v" and v_is_person)):
+                spans.append((len(text), len(text) + len(piece), ids[piece]))
+            text += piece
+    return text if ids is None else (text, spans)
 
 
 def generate(args):
     import tiktoken
     enc = tiktoken.get_encoding("gpt2")
-    world = build_world(args.n_people, args.seed)
     os.makedirs(args.out, exist_ok=True)
-    with open(os.path.join(args.out, "world.json"), "w") as f:
-        json.dump(world, f)
+    wpath = os.path.join(args.out, "world.json")
+    if os.path.exists(wpath):  # never silently change the world other files were built from
+        world = json.load(open(wpath))
+        assert len(world["people"]) == args.n_people, "world.json exists with a different n_people"
+    else:
+        world = build_world(args.n_people, args.seed)
+        json.dump(world, open(wpath, "w"))
     city_of = {p["name"]: p["city"] for p in world["people"]}
-    rng = random.Random(args.seed + 1)
+    ids = {p["name"]: i for i, p in enumerate(world["people"])} if args.labels else None
+    rng = random.Random(args.seed + 1 + (100 if args.labels else 0))
+    stem = "synth_lab_train" if args.labels else "synth_train"
     n = 0
-    with open(os.path.join(args.out, "synth_train.bin"), "wb") as f:
-        while n < args.tokens:
-            docs = [render_bio(rng, rng.choice(world["people"]), city_of) for _ in range(20000)]
-            toks = enc.encode_ordinary_batch(docs, num_threads=16)
+    ftok = open(os.path.join(args.out, stem + ".bin"), "wb")
+    fent = open(os.path.join(args.out, stem + "_ent.bin"), "wb") if args.labels else None
+    while n < args.tokens:
+        people = [rng.choice(world["people"]) for _ in range(20000)]
+        if not args.labels:
+            toks = enc.encode_ordinary_batch([render_bio(rng, p, city_of) for p in people], num_threads=16)
             arr = np.concatenate([np.array([enc.eot_token] + t, dtype=np.uint16) for t in toks])
-            f.write(arr.tobytes())
-            n += len(arr)
-            print(f"synth: {n/1e6:.1f}M tokens", flush=True)
+        else:
+            toks, ents = [], []
+            for p in people:
+                t, e = tokenize_with_entities(enc, *render_bio(rng, p, city_of, ids))
+                toks.append(np.array([enc.eot_token] + t, dtype=np.uint16))
+                ents.append(np.concatenate([[-1], e]).astype(np.int32))
+            arr = np.concatenate(toks)
+            fent.write(np.concatenate(ents).tobytes())
+        ftok.write(arr.tobytes())
+        n += len(arr)
+        print(f"{stem}: {n/1e6:.1f}M tokens", flush=True)
     print(f"{args.n_people} people, ~{n / args.n_people / 85:.0f} exposures each")
 
 
 # ---------------------------------------------------------------- evaluation
+
+@torch.no_grad()
+def score_candidates(model, device, items, max_tokens=4096):
+    """items: [(prefix_tokens, [candidate_tokens, ...])] -> (n_items, n_cand) summed log-probs."""
+    seqs = [(pt + ct, len(pt), len(ct), ii, ci) for ii, (pt, cands) in enumerate(items) for ci, ct in enumerate(cands)]
+    seqs.sort(key=lambda s: len(s[0]))
+    scores = np.zeros((len(items), max(len(c) for _, c in items)), dtype=np.float32)
+    was_training = model.training
+    model.eval()
+    s = 0
+    while s < len(seqs):
+        L = len(seqs[min(len(seqs) - 1, s + 1)][0])
+        bs = max(1, max_tokens // max(L, 1))
+        chunk = seqs[s:s + bs]
+        L = max(len(t) for t, *_ in chunk)
+        x = torch.zeros(len(chunk), L, dtype=torch.long)
+        mask = torch.zeros(len(chunk), L - 1)  # 1 where position predicts a candidate token
+        for j, (t, pl, cl, _, _) in enumerate(chunk):
+            x[j, : len(t)] = torch.tensor(t)
+            mask[j, pl - 1: pl - 1 + cl] = 1
+        x, mask = x.to(device), mask.to(device)
+        with torch.autocast("cuda", dtype=torch.bfloat16):
+            logits = model(x)[:, :-1]
+        # token log-prob without materializing a full log_softmax copy
+        tok_lp = logits.gather(-1, x[:, 1:, None]).squeeze(-1) - torch.logsumexp(logits, -1)
+        sc = (tok_lp * mask).sum(1).cpu().numpy()
+        for j, (*_, ii, ci) in enumerate(chunk):
+            scores[ii, ci] = sc[j]
+        del logits, tok_lp
+        s += len(chunk)
+    model.train(was_training)
+    return scores
+
 
 class SynthEval:
     def __init__(self, world, enc, n_eval=500, n_cand=16, seed=0):
@@ -137,36 +200,10 @@ class SynthEval:
                 items.append(("mentor_city", p["name"], prefix, self._cands(self.pools["city"], mc)))
         return items
 
-    @torch.no_grad()
-    def run(self, model, device, bs=128):
-        seqs, meta = [], []
-        for ii, (_, _, prefix, cands) in enumerate(self.items):
-            pt = self.enc.encode_ordinary(prefix)
-            for ci, c in enumerate(cands):
-                ct = self.enc.encode_ordinary(" " + c)
-                seqs.append((pt + ct, len(pt), len(ct)))
-                meta.append((ii, ci))
-        scores = np.zeros((len(self.items), self.n_cand), dtype=np.float32)
-        model.eval()
-        for s in range(0, len(seqs), bs):
-            chunk = seqs[s:s + bs]
-            L = max(len(t) for t, _, _ in chunk)
-            x = torch.zeros(len(chunk), L, dtype=torch.long)
-            mask = torch.zeros(len(chunk), L - 1)  # 1 where position predicts a candidate token
-            for j, (t, pl, cl) in enumerate(chunk):
-                x[j, : len(t)] = torch.tensor(t)
-                mask[j, pl - 1: pl - 1 + cl] = 1
-            x, mask = x.to(device), mask.to(device)
-            with torch.autocast("cuda", dtype=torch.bfloat16):
-                logits = model(x)[:, :-1]
-            # token log-prob without materializing a full log_softmax copy
-            tok_lp = logits.gather(-1, x[:, 1:, None]).squeeze(-1) - torch.logsumexp(logits, -1)
-            sc = (tok_lp * mask).sum(1).cpu().numpy()
-            for j in range(len(chunk)):
-                ii, ci = meta[s + j]
-                scores[ii, ci] = sc[j]
-            del logits, tok_lp
-        model.train()
+    def run(self, model, device):
+        enc = self.enc.encode_ordinary
+        scores = score_candidates(model, device, [(enc(prefix), [enc(" " + c) for c in cands])
+                                                  for _, _, prefix, cands in self.items])
         correct = scores.argmax(1) == 0
         res, know = {}, {}
         for (kind, name, _, _), ok in zip(self.items, correct):
@@ -189,5 +226,6 @@ if __name__ == "__main__":
     ap.add_argument("--n_people", type=int, default=30000)
     ap.add_argument("--tokens", type=float, default=150e6)
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--labels", action="store_true", help="also write per-token entity labels (synth_lab_train*)")
     ap.add_argument("--out", default="data")
     generate(ap.parse_args())
