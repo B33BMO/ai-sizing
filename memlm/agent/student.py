@@ -24,17 +24,30 @@ STOPS = ["</search>", "</graph>", "</answer>"]
 
 
 class Tools:
+    """client for the kb bridge; reconnects with backoff when the tunnel drops"""
     def __init__(self):
-        self.s = socket.create_connection(("127.0.0.1", 7777), timeout=120)
-        self.f = self.s.makefile("rw")
-        self.n = 0
+        self.f, self.n = None, 0
+
+    def _connect(self):
+        self.f = socket.create_connection(("127.0.0.1", 7777), timeout=120).makefile("rw")
 
     def __call__(self, kind, arg):
         self.n += 1
         req = {"id": self.n, "op": kind, **({"q": arg, "k": 4} if kind == "search" else {"entity": arg})}
-        self.f.write(json.dumps(req) + "\n")
-        self.f.flush()
-        return json.loads(self.f.readline())["text"]
+        for attempt in range(8):
+            try:
+                if self.f is None:
+                    self._connect()
+                self.f.write(json.dumps(req) + "\n")
+                self.f.flush()
+                line = self.f.readline()
+                if line:
+                    return json.loads(line)["text"]
+            except OSError:
+                pass
+            self.f = None
+            time.sleep(min(60, 5 * 2 ** attempt))
+        raise RuntimeError("kb bridge unreachable")
 
 
 def load(adapter=None):

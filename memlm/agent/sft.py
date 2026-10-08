@@ -64,8 +64,8 @@ def encode(r):
             msgs.append({"role": "user", "content": render_result(s["result"])})
     ids, labels, prev = [], [], 0
     for i in range(len(msgs)):
-        full = tok.apply_chat_template(msgs[: i + 1], tokenize=True, add_generation_prompt=False)
-        full = full["input_ids"] if isinstance(full, dict) else full
+        text = tok.apply_chat_template(msgs[: i + 1], tokenize=False, add_generation_prompt=False)
+        full = tok(text, add_special_tokens=False)["input_ids"]
         new = full[prev:]
         ids += new
         labels += new if msgs[i]["role"] == "assistant" else [-100] * len(new)

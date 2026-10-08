@@ -4,7 +4,7 @@ Runs on the Mac: one long-lived kb-serve over `wssh ssh bmo@srv`, served on loca
 newline-delimited JSON; `wssh ssh -N -R 7777:localhost:7777 bmo@windows` makes it reachable there.
 
   python3 agent/kb_bridge.py &
-  ~/wssh/wssh ssh -N -R 7777:localhost:7777 bmo@windows &
+  agent/tunnel.sh &        # keeps `wssh ssh -N -R 7777:localhost:7777 bmo@windows` alive
 """
 import json
 import os
@@ -15,8 +15,35 @@ import threading
 WSSH = os.path.expanduser("~/wssh/wssh")
 CMD = ("cd /mnt/d/spero/365helper && SAGE_DB_PATH=$HOME/memlm-spero/sage.db "
        "exec npx tsx $HOME/memlm-spero/kb-serve.ts 2>/dev/null")
-kb = subprocess.Popen([WSSH, "ssh", "bmo@srv", CMD], stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True, bufsize=1)
 lock = threading.Lock()
+kb = None
+
+
+def start_kb():
+    global kb
+    if kb is not None:
+        kb.kill()
+    kb = subprocess.Popen([WSSH, "ssh", "-o", "ServerAliveInterval=15", "bmo@srv", CMD],
+                          stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True, bufsize=1)
+    print("kb-serve (re)started", flush=True)
+
+
+def ask(line):
+    """forward one request; if the srv session dropped, restart it and retry once"""
+    for attempt in range(2):
+        try:
+            if kb is None or kb.poll() is not None:
+                start_kb()
+            kb.stdin.write(line + "\n")
+            kb.stdin.flush()
+            resp = kb.stdout.readline()
+            if resp:
+                return resp
+        except (BrokenPipeError, OSError):
+            pass
+        start_kb()
+    rid = json.loads(line).get("id")
+    return json.dumps({"id": rid, "ok": False, "text": "tool server unavailable"}) + "\n"
 
 
 class Handler(socketserver.StreamRequestHandler):
@@ -25,9 +52,7 @@ class Handler(socketserver.StreamRequestHandler):
             if not line.strip():
                 continue
             with lock:  # kb-serve answers in order; keep request/response pairs together
-                kb.stdin.write(line.decode().strip() + "\n")
-                kb.stdin.flush()
-                resp = kb.stdout.readline()
+                resp = ask(line.decode().strip())
             self.wfile.write(resp.encode())
             self.wfile.flush()
 
@@ -38,5 +63,6 @@ class Server(socketserver.ThreadingTCPServer):
 
 
 if __name__ == "__main__":
+    start_kb()
     print("kb bridge on localhost:7777", flush=True)
     Server(("127.0.0.1", 7777), Handler).serve_forever()
