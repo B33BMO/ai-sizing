@@ -87,6 +87,7 @@ else:
                                              target_modules=["q_proj", "k_proj", "v_proj", "o_proj",
                                                              "gate_proj", "up_proj", "down_proj"]))
 model.print_trainable_parameters()
+causal = model.get_base_model()  # the LoRA-injected CausalLM: .model (decoder) + .lm_head
 opt = torch.optim.AdamW([p for p in model.parameters() if p.requires_grad], lr=args.lr, weight_decay=0.0)
 steps = math.ceil(args.epochs * n_tok / args.tokens_per_step)
 sched = torch.optim.lr_scheduler.LambdaLR(opt, lambda s: min(1.0, (s + 1) / 10) * 0.5 * (1 + math.cos(math.pi * s / steps)))
@@ -106,7 +107,12 @@ while step < steps:
     if n_lab == 0:
         continue
     with torch.autocast("cuda", dtype=torch.bfloat16):
-        loss = model(input_ids=x, labels=y).loss
+        # project only the trained positions through lm_head: full-vocab (152k) fp32 logits for a
+        # 6k-token trace are ~3.7 GB and push the 16 GB card into WSL's slow sysmem fallback
+        h = causal.model(input_ids=x).last_hidden_state[:, :-1]
+        tgt = y[:, 1:]
+        keep = tgt != -100
+        loss = torch.nn.functional.cross_entropy(causal.lm_head(h[keep]).float(), tgt[keep])
     # weight by tokens so long and short traces count per token
     (loss * n_lab / 2000).backward()
     acc_tok += len(ids)
