@@ -13,9 +13,19 @@ TOOLS_RE = re.compile(r"<(search|graph|answer)>(.*?)</\1>", re.S)
 MAX_RESULT_CHARS = 3500
 
 
-def render_result(text):
+LAST_CALL = "No tool calls left: reply now with <answer>...</answer>."
+
+
+def render_result(text, last=False):
+    """last: this was the final allowed tool call, so the model must answer next"""
     text = text if len(text) <= MAX_RESULT_CHARS else text[:MAX_RESULT_CHARS] + "\n[...truncated]"
-    return f"<result>\n{text}\n</result>"
+    return f"<result>\n{text}\n</result>" + (f"\n{LAST_CALL}" if last else "")
+
+
+def has_duplicate_calls(steps):
+    """true if the same tool was called twice with the same argument (a wasted turn)"""
+    calls = [(s.get("tool"), " ".join(norm(s.get("arg")))) for s in steps if s.get("tool") in ("search", "graph")]
+    return len(calls) != len(set(calls))
 
 
 def norm(s):

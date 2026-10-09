@@ -80,8 +80,9 @@ def run(item):
             steps.append({"text": text, "tool": "answer" if kind == "answer" else None, "arg": arg, "result": None})
             break
         result = tool(kind, arg)
-        steps.append({"text": text, "tool": kind, "arg": arg, "result": result})
-        msgs += [{"role": "assistant", "content": text}, {"role": "user", "content": render_result(result)}]
+        last = turn == args.max_turns - 2
+        steps.append({"text": text, "tool": kind, "arg": arg, "result": result, "last": last})
+        msgs += [{"role": "assistant", "content": text}, {"role": "user", "content": render_result(result, last)}]
     return {"q": item["q"], "gold": item["answer"], "steps": steps, "answer": answer,
             "correct": grade(answer, item["answer"]), "turns": len(steps)}
 

@@ -17,7 +17,7 @@ from peft import LoraConfig, PeftModel, get_peft_model
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 sys.path.insert(0, os.path.dirname(__file__))
-from protocol import SYSTEM, render_result  # noqa: E402
+from protocol import SYSTEM, has_duplicate_calls, render_result  # noqa: E402
 from student import MODEL  # noqa: E402
 
 ap = argparse.ArgumentParser()
@@ -39,7 +39,8 @@ by_q = defaultdict(list)
 for path in args.traces.split(","):
     for line in open(path):
         r = json.loads(line)
-        if r["correct"] and r["q"] not in test_qs and r["steps"] and r["steps"][-1].get("tool") == "answer":
+        if (r["correct"] and r["q"] not in test_qs and r["steps"] and r["steps"][-1].get("tool") == "answer"
+                and not has_duplicate_calls(r["steps"])):
             by_q[r["q"]].append(r)
 traces = []
 for q, rs in by_q.items():
@@ -61,7 +62,7 @@ def encode(r):
     for s in r["steps"]:
         msgs.append({"role": "assistant", "content": s["text"]})
         if s.get("result") is not None:
-            msgs.append({"role": "user", "content": render_result(s["result"])})
+            msgs.append({"role": "user", "content": render_result(s["result"], s.get("last", False))})
     ids, labels, prev = [], [], 0
     for i in range(len(msgs)):
         text = tok.apply_chat_template(msgs[: i + 1], tokenize=False, add_generation_prompt=False)

@@ -109,8 +109,10 @@ def run(tok, model, items, mode, out_path, bs, max_turns=5, temp=0.0):
                     st["open"] = False
                     continue
                 result = tools(kind, arg)
-                st["steps"].append({"text": out, "tool": kind, "arg": arg, "result": result})
-                convs[i] += [{"role": "assistant", "content": out}, {"role": "user", "content": render_result(result)}]
+                last = turn == max_turns - 2  # the next turn must be the answer
+                st["steps"].append({"text": out, "tool": kind, "arg": arg, "result": result, "last": last})
+                convs[i] += [{"role": "assistant", "content": out},
+                             {"role": "user", "content": render_result(result, last)}]
         for it, st in zip(batch, state):
             ok = grade(st["answer"], it["answer"])
             n += 1
