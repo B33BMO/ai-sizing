@@ -129,7 +129,8 @@ def fmt_eta(sec):
 
 # ---------------------------------------------------------------- agent (Spero tool-use training)
 AGENT_DIR = os.path.expanduser("~/memlm2/runs/agent")
-TEACHER_REF = ("gemma-31B + tools (teacher)", 0.540)
+# reference models, fair-graded (agent/regrade.py: verbose answers reduced to the entity they commit to)
+REFS = [("gemma-31B + tools (round 1-2 teacher)", 0.538), ("GLM-5.3 + tools (Ollama Cloud; the target)", 0.660)]
 _rate = {}  # path -> (first_seen_time, first_count): progress rate measured while the dashboard runs
 _qcount = {}
 
@@ -213,7 +214,8 @@ def agent_panel():
         acc = sum(r["correct"] for r in rows) / len(rows)
         label = names.get(key, re.sub(r"^r(\d+)_tools$", r"round \1", key))
         score.add_row(label, f"[bold]{acc * 100:.1f}%[/]", str(len(rows)), str(sum(r["answer"] is None for r in rows)))
-    score.add_row(f"[dim]{TEACHER_REF[0]}", f"[dim]{TEACHER_REF[1] * 100:.1f}%", "[dim]500", "")
+    for name, acc in REFS:
+        score.add_row(f"[dim]{name}", f"[dim]{acc * 100:.1f}%", "[dim]500", "")
     return Panel(Group(work, score), title="[bold]agent: Qwen3-4B learning Spero's tools[/]", border_style="green")
 
 
