@@ -29,7 +29,9 @@ class Tools:
         self.f, self.n = None, 0
 
     def _connect(self):
-        self.f = socket.create_connection(("127.0.0.1", 7777), timeout=120).makefile("rw")
+        # KB_ADDR=192.168.1.248:7787 -> always-on service on srv; default = Mac bridge via tunnel
+        host, port = os.environ.get("KB_ADDR", "127.0.0.1:7777").rsplit(":", 1)
+        self.f = socket.create_connection((host, int(port)), timeout=120).makefile("rw")
 
     def __call__(self, kind, arg):
         self.n += 1
