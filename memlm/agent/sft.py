@@ -26,6 +26,8 @@ ap.add_argument("--out", required=True)
 ap.add_argument("--init_adapter")
 ap.add_argument("--exclude", default="data/spero_qa.json", help="never train on these (test) questions")
 ap.add_argument("--per_q", type=int, default=2)
+ap.add_argument("--max_answer_words", type=int, default=10,
+                help="drop traces whose final answer is longer (the grader's contains-match would reward padding)")
 ap.add_argument("--epochs", type=float, default=2)
 ap.add_argument("--lr", type=float, default=1e-4)
 ap.add_argument("--rank", type=int, default=32)
@@ -40,7 +42,7 @@ for path in args.traces.split(","):
     for line in open(path):
         r = json.loads(line)
         if (r["correct"] and r["q"] not in test_qs and r["steps"] and r["steps"][-1].get("tool") == "answer"
-                and not has_duplicate_calls(r["steps"])):
+                and not has_duplicate_calls(r["steps"]) and len((r.get("answer") or "").split()) <= args.max_answer_words):
             by_q[r["q"]].append(r)
 traces = []
 for q, rs in by_q.items():

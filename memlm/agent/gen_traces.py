@@ -12,6 +12,7 @@ import os
 import re
 import subprocess
 import threading
+import time
 import urllib.request
 
 from protocol import SYSTEM, grade, render_result
@@ -23,12 +24,22 @@ ap.add_argument("--workers", type=int, default=6)
 ap.add_argument("--limit", type=int, default=0)
 ap.add_argument("--endpoint", default="https://llama2.coleman-it.com/v1/chat/completions")
 ap.add_argument("--max_turns", type=int, default=5)
+ap.add_argument("--api", default="openai", choices=["openai", "ollama"],
+                help="ollama = Ollama Cloud /api/chat with OLLAMA_API_KEY from the environment")
+ap.add_argument("--model", default="x")
+ap.add_argument("--kb", default="", help="host:port of the tool service (e.g. 192.168.1.248:7787); default spawns kb-serve locally")
 args = ap.parse_args()
 
 SPERO = "/mnt/d/spero/365helper"
-env = dict(os.environ, SAGE_DB_PATH=os.path.expanduser("~/memlm-spero/sage.db"))
-kb = subprocess.Popen(["npx", "tsx", os.path.expanduser("~/memlm-spero/kb-serve.ts")], cwd=SPERO, env=env,
-                      stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, bufsize=1)
+if args.kb:  # always-on tool service (kb_service.py) over TCP
+    import socket
+    _host, _port = args.kb.rsplit(":", 1)
+    _f = socket.create_connection((_host, int(_port)), timeout=120).makefile("rw")
+    kb = type("KB", (), {"stdin": _f, "stdout": _f})()
+else:
+    env = dict(os.environ, SAGE_DB_PATH=os.path.expanduser("~/memlm-spero/sage.db"))
+    kb = subprocess.Popen(["npx", "tsx", os.path.expanduser("~/memlm-spero/kb-serve.ts")], cwd=SPERO, env=env,
+                          stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, bufsize=1)
 kb_lock = threading.Lock()
 req_id = [0]
 
@@ -42,12 +53,31 @@ def tool(kind, arg):
         return json.loads(kb.stdout.readline())["text"]
 
 
+STOPS = ["</search>", "</graph>", "</answer>"]
+
+
 def llm(messages):
-    body = json.dumps({"model": "x", "max_tokens": 400, "temperature": 0.4, "messages": messages,
-                       "stop": ["</search>", "</graph>", "</answer>"],
-                       "chat_template_kwargs": {"enable_thinking": False}}).encode()
-    req = urllib.request.Request(args.endpoint, body, {"Content-Type": "application/json"})
-    return json.load(urllib.request.urlopen(req, timeout=300))["choices"][0]["message"]["content"] or ""
+    if args.api == "ollama":
+        body = {"model": args.model, "messages": messages, "stream": False, "think": False,
+                "options": {"temperature": 0.4, "num_predict": 400, "stop": STOPS}}
+        headers = {"Content-Type": "application/json", "Authorization": f"Bearer {os.environ['OLLAMA_API_KEY']}"}
+    else:
+        body = {"model": args.model, "max_tokens": 400, "temperature": 0.4, "messages": messages, "stop": STOPS,
+                "chat_template_kwargs": {"enable_thinking": False}}
+        headers = {"Content-Type": "application/json"}
+    req = urllib.request.Request(args.endpoint, json.dumps(body).encode(), headers)
+    for attempt in range(5):  # cloud APIs rate-limit / blip: back off and retry
+        try:
+            r = json.load(urllib.request.urlopen(req, timeout=300))
+            break
+        except Exception:
+            if attempt == 4:
+                raise
+            time.sleep(10 * 2 ** attempt)
+    out = r["message"]["content"] if args.api == "ollama" else r["choices"][0]["message"]["content"]
+    # some servers ignore stop sequences: cut at the first closing tag ourselves
+    cut = min([out.find(s) for s in STOPS if s in (out or "")] or [len(out or "")])
+    return (out or "")[:cut]
 
 
 JUNK = re.compile(r"<\|?channel\|?>|</?thought>?|^\s*thought\b", re.M)
