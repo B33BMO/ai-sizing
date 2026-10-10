@@ -2,6 +2,7 @@
 
 Reads ~/memlm and ~/memlm2: the run order from exp*.sh, progress/metrics from runs/*/log.jsonl.
 """
+import glob
 import json
 import os
 import re
@@ -126,6 +127,96 @@ def fmt_eta(sec):
     return f"{h}h{m:02d}m" if h else f"{m}m"
 
 
+# ---------------------------------------------------------------- agent (Spero tool-use training)
+AGENT_DIR = os.path.expanduser("~/memlm2/runs/agent")
+TEACHER_REF = ("gemma-31B + tools (teacher)", 0.540)
+_rate = {}  # path -> (first_seen_time, first_count): progress rate measured while the dashboard runs
+_qcount = {}
+
+
+def n_questions(path):
+    if path not in _qcount:
+        try:
+            _qcount[path] = len(json.load(open(os.path.join(os.path.expanduser("~/memlm2"), path))))
+        except Exception:
+            _qcount[path] = 0
+    return _qcount[path]
+
+
+def eta_from(key, done, total):
+    t0, c0 = _rate.setdefault(key, (time.time(), done))
+    if done > c0 and time.time() - t0 > 20:
+        return (total - done) * (time.time() - t0) / (done - c0)
+    return None
+
+
+def count_lines(path):
+    try:
+        with open(path) as f:
+            return sum(1 for _ in f)
+    except OSError:
+        return 0
+
+
+def agent_panel():
+    if not os.path.isdir(AGENT_DIR):
+        return None
+    work = Table(box=box.SIMPLE, expand=True, header_style="bold cyan")
+    for col in ["job", "progress", "ETA", "detail"]:
+        work.add_column(col, no_wrap=True)
+    procs = subprocess.run(["pgrep", "-fa", "agent/(student|sft).py"], capture_output=True, text=True).stdout
+    for line in procs.splitlines():
+        if "agent/sft.py" in line:
+            logs = sorted(glob.glob(os.path.expanduser("~/memlm2/sft_r*.log")), key=os.path.getmtime)
+            txt = open(logs[-1]).read() if logs else ""
+            st = re.findall(r"step (\d+)/(\d+) loss ([\d.]+)", txt)
+            info = re.search(r"(\d+) traces from (\d+) questions", txt)
+            done, total, loss = (int(st[-1][0]), int(st[-1][1]), st[-1][2]) if st else (0, 1, "–")
+            prog = done / total
+            work.add_row(f"SFT {os.path.basename(logs[-1])[4:-4] if logs else ''}",
+                         f"{'█' * int(prog * 14)}{'░' * (14 - int(prog * 14))} {done}/{total}",
+                         fmt_eta(eta_from("sft:" + (logs[-1] if logs else ""), done, total)),
+                         f"loss {loss}" + (f" · {info.group(1)} traces / {info.group(2)} questions" if info else ""))
+        elif "agent/student.py" in line:
+            out = re.search(r"--out (\S+)", line).group(1)
+            qs = re.search(r"--questions (\S+)", line).group(1)
+            att = int((re.search(r"--attempts (\d+)", line) or [0, 1])[1])
+            path = os.path.join(os.path.expanduser("~/memlm2"), out)
+            if att > 1:  # one file per attempt: the newest existing one is in progress
+                files = [path.replace(".jsonl", f".a{k}.jsonl") for k in range(att)]
+                k = max([i for i, f in enumerate(files) if os.path.exists(f)] or [0])
+                path, label = files[k], f"sample {os.path.basename(out)[:-6]} (attempt {k + 1}/{att})"
+            else:
+                label = f"eval {os.path.basename(out)[:-6]}"
+            done, total = count_lines(path), n_questions(qs) or 1
+            rows = [json.loads(l) for l in open(path)] if os.path.exists(path) else []
+            acc = sum(r["correct"] for r in rows) / len(rows) if rows else float("nan")
+            prog = done / total
+            work.add_row(label, f"{'█' * int(prog * 14)}{'░' * (14 - int(prog * 14))} {done}/{total}",
+                         fmt_eta(eta_from(path, done, total)), f"acc so far {pct(acc)}")
+    if not procs.strip():
+        work.add_row("[dim]idle", "", "", "")
+
+    score = Table(box=box.SIMPLE, expand=True, header_style="bold cyan")
+    for col, j in [("model / setting", "left"), ("Spero QA (test)", "right"), ("n", "right"), ("no answer", "right")]:
+        score.add_column(col, justify=j, no_wrap=True)
+    names = {"base_closed": "Qwen3-4B, closed-book", "base_tools": "Qwen3-4B + tools (untrained)",
+             "r1_tools": "round 1", "r1f_tools": "round 1 + forced answer"}
+    order = {"base_closed": 0, "base_tools": 1}  # then rounds in name order (r1, r1f, r2, ...)
+    files = sorted(glob.glob(f"{AGENT_DIR}/*_tools.jsonl") + glob.glob(f"{AGENT_DIR}/*_closed.jsonl"),
+                   key=lambda f: (order.get(os.path.basename(f)[:-6], 2), os.path.basename(f)))
+    for f in files:
+        key = os.path.basename(f)[:-6]
+        rows = [json.loads(l) for l in open(f)]
+        if not rows:
+            continue
+        acc = sum(r["correct"] for r in rows) / len(rows)
+        label = names.get(key, re.sub(r"^r(\d+)_tools$", r"round \1", key))
+        score.add_row(label, f"[bold]{acc * 100:.1f}%[/]", str(len(rows)), str(sum(r["answer"] is None for r in rows)))
+    score.add_row(f"[dim]{TEACHER_REF[0]}", f"[dim]{TEACHER_REF[1] * 100:.1f}%", "[dim]500", "")
+    return Panel(Group(work, score), title="[bold]agent: Qwen3-4B learning Spero's tools[/]", border_style="green")
+
+
 def build():
     live = running_names()
     rows, active, errors = [], None, []
@@ -198,6 +289,9 @@ def build():
         if any("graph_loss" in s for s in d["steps"]):
             line("graph loss (smoothed)", "graph_loss", lambda v: f"{v:.3f}", d["steps"], sm=True)
         parts.append(Panel(det, title=f"[bold]{name}[/] trends (each tick = one eval)", border_style="yellow"))
+    ap = agent_panel()
+    if ap is not None:
+        parts.insert(0, ap)
     for e in errors:
         parts.append(Text(f"⚠ {e}", style="bold red"))
     finish = (datetime.now() + timedelta(seconds=clock)).strftime("%a %H:%M") if clock else "–"
