@@ -31,14 +31,15 @@ def extract(q, a):
     return None if out.upper().startswith("NONE") else out.strip('"').strip()
 
 
-for path in sys.argv[1:]:
-    rows = [json.loads(l) for l in open(path)]
-    long_ = [i for i, r in enumerate(rows) if r["answer"] and len(r["answer"].split()) > MAX_WORDS]
-    with cf.ThreadPoolExecutor(6) as ex:
-        ext = dict(zip(long_, ex.map(lambda i: extract(rows[i]["q"], rows[i]["answer"]), long_)))
-    ok = [grade(ext[i], r["gold"]) if i in ext else r["correct"] for i, r in enumerate(rows)]
-    res = {"file": path, "n": len(rows), "raw": sum(r["correct"] for r in rows) / len(rows),
-           "fair": sum(ok) / len(rows), "n_extracted": len(long_)}
-    json.dump({**res, "extracted": {rows[i]["q"]: e for i, e in ext.items()}},
-              open(path.replace(".jsonl", ".regraded.json"), "w"), indent=1)
-    print(f"{os.path.basename(path):<24} raw {res['raw']:.1%}  fair {res['fair']:.1%}  ({len(long_)} long answers re-graded)", flush=True)
+if __name__ == "__main__":
+    for path in sys.argv[1:]:
+        rows = [json.loads(l) for l in open(path)]
+        long_ = [i for i, r in enumerate(rows) if r["answer"] and len(r["answer"].split()) > MAX_WORDS]
+        with cf.ThreadPoolExecutor(6) as ex:
+            ext = dict(zip(long_, ex.map(lambda i: extract(rows[i]["q"], rows[i]["answer"]), long_)))
+        ok = [grade(ext[i], r["gold"]) if i in ext else r["correct"] for i, r in enumerate(rows)]
+        res = {"file": path, "n": len(rows), "raw": sum(r["correct"] for r in rows) / len(rows),
+               "fair": sum(ok) / len(rows), "n_extracted": len(long_)}
+        json.dump({**res, "extracted": {rows[i]["q"]: e for i, e in ext.items()}},
+                  open(path.replace(".jsonl", ".regraded.json"), "w"), indent=1)
+        print(f"{os.path.basename(path):<24} raw {res['raw']:.1%}  fair {res['fair']:.1%}  ({len(long_)} long answers re-graded)", flush=True)
