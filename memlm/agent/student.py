@@ -12,7 +12,7 @@ import sys
 import time
 
 import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoModelForCausalLM, AutoTokenizer, StoppingCriteria, StoppingCriteriaList
 
 sys.path.insert(0, os.path.dirname(__file__))
 from protocol import SYSTEM, grade, render_result  # noqa: E402
@@ -52,10 +52,12 @@ class Tools:
         raise RuntimeError("kb bridge unreachable")
 
 
-def load(adapter=None):
-    tok = AutoTokenizer.from_pretrained(MODEL)
+def load(adapter=None, name=None):
+    name = name or MODEL
+    tok = AutoTokenizer.from_pretrained(name)
     tok.padding_side = "left"
-    model = AutoModelForCausalLM.from_pretrained(MODEL, dtype=torch.bfloat16, device_map="cuda")
+    model = AutoModelForCausalLM.from_pretrained(name, dtype=torch.bfloat16, device_map="cuda")
+    model.thinking = "Thinking" in name  # chat template opens <think>: replies are thinking, </think>, action
     if adapter:
         from peft import PeftModel
         model = PeftModel.from_pretrained(model, adapter)
@@ -63,21 +65,49 @@ def load(adapter=None):
     return tok, model
 
 
+class StopAfterThink(StoppingCriteria):
+    """Per-sequence stop for thinking models: only a closing tool tag *after* </think> ends the turn
+    (the model may write tags while thinking)."""
+    def __init__(self, tok, start):
+        self.tok, self.start = tok, start
+
+    def __call__(self, input_ids, scores, **kw):
+        done = []
+        for row in input_ids:
+            t = self.tok.decode(row[self.start:], skip_special_tokens=True)
+            after = t.split("</think>", 1)[1] if "</think>" in t else ""
+            done.append(any(s in after for s in STOPS))
+        return torch.tensor(done, device=input_ids.device)
+
+
+def split_think(t):
+    """-> (thinking, action text). No </think> means the turn never got past thinking."""
+    if "</think>" not in t:
+        return t, ""
+    think, act = t.rsplit("</think>", 1)
+    return think.replace("<think>", "").strip(), act
+
+
 @torch.no_grad()
 def generate(tok, model, convs, max_new=256, temp=0.0, prefixes=None):
+    """-> (actions, thoughts). prefixes: text the assistant turn is forced to start with."""
     """prefixes: text the assistant turn is forced to start with (e.g. "<answer>" on the last turn)"""
     prefixes = prefixes or [""] * len(convs)
     texts = [tok.apply_chat_template(c, tokenize=False, add_generation_prompt=True) + p for c, p in zip(convs, prefixes)]
     enc = tok(texts, return_tensors="pt", padding=True).to("cuda")
     sample = {"do_sample": True, "temperature": temp, "top_p": 0.95} if temp > 0 else {"do_sample": False}
-    out = model.generate(**enc, max_new_tokens=max_new, stop_strings=STOPS, tokenizer=tok,
-                         pad_token_id=tok.pad_token_id, **sample)
-    res = []
+    thinking = getattr(model, "thinking", False)
+    stop = ({"stopping_criteria": StoppingCriteriaList([StopAfterThink(tok, enc["input_ids"].shape[1])])} if thinking
+            else {"stop_strings": STOPS, "tokenizer": tok})
+    out = model.generate(**enc, max_new_tokens=max_new, pad_token_id=tok.pad_token_id, **stop, **sample)
+    res, thoughts = [], []
     for row, p in zip(out[:, enc["input_ids"].shape[1]:], prefixes):
         t = p + tok.decode(row, skip_special_tokens=True)
+        think, t = split_think(t) if thinking else ("", t)
         cut = min([t.find(s) + len(s) for s in STOPS if s in t] or [len(t)])
         res.append(t[:cut].strip())
-    return res
+        thoughts.append(think)
+    return res, thoughts
 
 
 def run(tok, model, items, mode, out_path, bs, max_turns=5, temp=0.0, max_new=256, force_answer=True):
@@ -100,24 +130,24 @@ def run(tok, model, items, mode, out_path, bs, max_turns=5, temp=0.0, max_new=25
                 break
             # last allowed turn: the reply must be an answer, so start it with the tag
             final = force_answer and mode == "tools" and turn == max_turns - 1
-            outs = generate(tok, model, [convs[i] for i in live], max_new=max_new, temp=temp,
-                            prefixes=["<answer>" if final else ""] * len(live))
-            for i, out in zip(live, outs):
+            outs, thinks = generate(tok, model, [convs[i] for i in live], max_new=max_new, temp=temp,
+                                    prefixes=["<answer>" if final else ""] * len(live))
+            for i, out, think in zip(live, outs, thinks):
                 m = list(re.finditer(r"<(search|graph|answer)>(.*?)</\1>", out, re.S))
                 st = state[i]
                 if not m:
-                    st["steps"].append({"text": out, "tool": None})
+                    st["steps"].append({"text": out, "tool": None, "think": think})
                     st["open"] = False
                     continue
                 kind, arg = m[-1].group(1), m[-1].group(2).strip()
                 if kind == "answer" or mode != "tools" or turn == max_turns - 1:
                     st["answer"] = arg if kind == "answer" else None
-                    st["steps"].append({"text": out, "tool": kind})
+                    st["steps"].append({"text": out, "tool": kind, "think": think})
                     st["open"] = False
                     continue
                 result = tools(kind, arg)
                 last = turn == max_turns - 2  # the next turn must be the answer
-                st["steps"].append({"text": out, "tool": kind, "arg": arg, "result": result, "last": last})
+                st["steps"].append({"text": out, "tool": kind, "arg": arg, "result": result, "last": last, "think": think})
                 convs[i] += [{"role": "assistant", "content": out},
                              {"role": "user", "content": render_result(result, last)}]
         for it, st in zip(batch, state):
@@ -139,6 +169,7 @@ if __name__ == "__main__":
     ap.add_argument("--questions", required=True)
     ap.add_argument("--out", required=True)
     ap.add_argument("--adapter")
+    ap.add_argument("--model", default=MODEL, help="e.g. Qwen/Qwen3-4B-Thinking-2507")
     ap.add_argument("--mode", default="tools", choices=["tools", "closed"])
     ap.add_argument("--limit", type=int, default=0)
     ap.add_argument("--bs", type=int, default=8)
@@ -150,7 +181,7 @@ if __name__ == "__main__":
     a = ap.parse_args()
     os.makedirs(os.path.dirname(a.out), exist_ok=True)
     qs = json.load(open(a.questions))
-    tok, model = load(a.adapter)
+    tok, model = load(a.adapter, a.model)
     qs = qs[: a.limit] if a.limit else qs
     if a.attempts > 1:  # one output file per attempt, so resume logic works per attempt
         for k in range(a.attempts):
