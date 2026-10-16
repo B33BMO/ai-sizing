@@ -64,21 +64,23 @@ def load(adapter=None):
 
 
 @torch.no_grad()
-def generate(tok, model, convs, max_new=256, temp=0.0):
-    texts = [tok.apply_chat_template(c, tokenize=False, add_generation_prompt=True) for c in convs]
+def generate(tok, model, convs, max_new=256, temp=0.0, prefixes=None):
+    """prefixes: text the assistant turn is forced to start with (e.g. "<answer>" on the last turn)"""
+    prefixes = prefixes or [""] * len(convs)
+    texts = [tok.apply_chat_template(c, tokenize=False, add_generation_prompt=True) + p for c, p in zip(convs, prefixes)]
     enc = tok(texts, return_tensors="pt", padding=True).to("cuda")
     sample = {"do_sample": True, "temperature": temp, "top_p": 0.95} if temp > 0 else {"do_sample": False}
     out = model.generate(**enc, max_new_tokens=max_new, stop_strings=STOPS, tokenizer=tok,
                          pad_token_id=tok.pad_token_id, **sample)
     res = []
-    for row in out[:, enc["input_ids"].shape[1]:]:
-        t = tok.decode(row, skip_special_tokens=True)
+    for row, p in zip(out[:, enc["input_ids"].shape[1]:], prefixes):
+        t = p + tok.decode(row, skip_special_tokens=True)
         cut = min([t.find(s) + len(s) for s in STOPS if s in t] or [len(t)])
         res.append(t[:cut].strip())
     return res
 
 
-def run(tok, model, items, mode, out_path, bs, max_turns=5, temp=0.0, max_new=256):
+def run(tok, model, items, mode, out_path, bs, max_turns=5, temp=0.0, max_new=256, force_answer=True):
     tools = Tools() if mode == "tools" else None
     done = set()
     if os.path.exists(out_path):
@@ -96,7 +98,10 @@ def run(tok, model, items, mode, out_path, bs, max_turns=5, temp=0.0, max_new=25
             live = [i for i, s in enumerate(state) if s["open"]]
             if not live:
                 break
-            outs = generate(tok, model, [convs[i] for i in live], max_new=max_new, temp=temp)
+            # last allowed turn: the reply must be an answer, so start it with the tag
+            final = force_answer and mode == "tools" and turn == max_turns - 1
+            outs = generate(tok, model, [convs[i] for i in live], max_new=max_new, temp=temp,
+                            prefixes=["<answer>" if final else ""] * len(live))
             for i, out in zip(live, outs):
                 m = list(re.finditer(r"<(search|graph|answer)>(.*?)</\1>", out, re.S))
                 st = state[i]
@@ -138,6 +143,7 @@ if __name__ == "__main__":
     ap.add_argument("--limit", type=int, default=0)
     ap.add_argument("--bs", type=int, default=8)
     ap.add_argument("--temp", type=float, default=0.0, help=">0 samples (for expert-iteration attempts)")
+    ap.add_argument("--no_force_answer", action="store_true", help="don't pre-fill <answer> on the final turn")
     ap.add_argument("--max_new", type=int, default=768,
                     help="tokens per turn; GLM-style reasoning overflowed 256 and lost the tool tag")
     ap.add_argument("--attempts", type=int, default=1, help="repeat each question this many times (with --temp)")
@@ -149,6 +155,7 @@ if __name__ == "__main__":
     if a.attempts > 1:  # one output file per attempt, so resume logic works per attempt
         for k in range(a.attempts):
             torch.manual_seed(k)
-            run(tok, model, qs, a.mode, a.out.replace(".jsonl", f".a{k}.jsonl"), a.bs, temp=a.temp, max_new=a.max_new)
+            run(tok, model, qs, a.mode, a.out.replace(".jsonl", f".a{k}.jsonl"), a.bs, temp=a.temp, max_new=a.max_new,
+                force_answer=not a.no_force_answer)
     else:
-        run(tok, model, qs, a.mode, a.out, a.bs, temp=a.temp, max_new=a.max_new)
+        run(tok, model, qs, a.mode, a.out, a.bs, temp=a.temp, max_new=a.max_new, force_answer=not a.no_force_answer)
