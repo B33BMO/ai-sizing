@@ -78,7 +78,7 @@ def generate(tok, model, convs, max_new=256, temp=0.0):
     return res
 
 
-def run(tok, model, items, mode, out_path, bs, max_turns=5, temp=0.0):
+def run(tok, model, items, mode, out_path, bs, max_turns=5, temp=0.0, max_new=256):
     tools = Tools() if mode == "tools" else None
     done = set()
     if os.path.exists(out_path):
@@ -96,7 +96,7 @@ def run(tok, model, items, mode, out_path, bs, max_turns=5, temp=0.0):
             live = [i for i, s in enumerate(state) if s["open"]]
             if not live:
                 break
-            outs = generate(tok, model, [convs[i] for i in live], temp=temp)
+            outs = generate(tok, model, [convs[i] for i in live], max_new=max_new, temp=temp)
             for i, out in zip(live, outs):
                 m = list(re.finditer(r"<(search|graph|answer)>(.*?)</\1>", out, re.S))
                 st = state[i]
@@ -138,6 +138,8 @@ if __name__ == "__main__":
     ap.add_argument("--limit", type=int, default=0)
     ap.add_argument("--bs", type=int, default=8)
     ap.add_argument("--temp", type=float, default=0.0, help=">0 samples (for expert-iteration attempts)")
+    ap.add_argument("--max_new", type=int, default=768,
+                    help="tokens per turn; GLM-style reasoning overflowed 256 and lost the tool tag")
     ap.add_argument("--attempts", type=int, default=1, help="repeat each question this many times (with --temp)")
     a = ap.parse_args()
     os.makedirs(os.path.dirname(a.out), exist_ok=True)
@@ -147,6 +149,6 @@ if __name__ == "__main__":
     if a.attempts > 1:  # one output file per attempt, so resume logic works per attempt
         for k in range(a.attempts):
             torch.manual_seed(k)
-            run(tok, model, qs, a.mode, a.out.replace(".jsonl", f".a{k}.jsonl"), a.bs, temp=a.temp)
+            run(tok, model, qs, a.mode, a.out.replace(".jsonl", f".a{k}.jsonl"), a.bs, temp=a.temp, max_new=a.max_new)
     else:
-        run(tok, model, qs, a.mode, a.out, a.bs, temp=a.temp)
+        run(tok, model, qs, a.mode, a.out, a.bs, temp=a.temp, max_new=a.max_new)
