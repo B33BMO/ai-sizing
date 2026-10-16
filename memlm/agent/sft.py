@@ -9,6 +9,7 @@ import json
 import math
 import os
 import random
+import re
 import sys
 from collections import defaultdict
 
@@ -26,6 +27,9 @@ ap.add_argument("--out", required=True)
 ap.add_argument("--init_adapter")
 ap.add_argument("--exclude", default="data/spero_qa.json", help="never train on these (test) questions")
 ap.add_argument("--per_q", type=int, default=2)
+ap.add_argument("--max_thought_chars", type=int, default=0,
+                help="trim the reasoning before each tool call to its last sentences (0 = keep); a 4B copying "
+                     "GLM-length thoughts rambles and never emits the tag")
 ap.add_argument("--max_answer_words", type=int, default=10,
                 help="drop traces whose final answer is longer (the grader's contains-match would reward padding)")
 ap.add_argument("--epochs", type=float, default=2)
@@ -58,11 +62,31 @@ print(f"{len(traces)} traces from {len(by_q)} questions")
 tok = AutoTokenizer.from_pretrained(MODEL)
 
 
+LEAKED = re.compile(r"</?think>|</?tool_call>")  # teacher/base-model markup that is not part of our protocol
+
+
+def trim_thought(text, limit):
+    """keep the tool call and only the last sentence(s) of the reasoning before it, up to limit chars"""
+    text = re.sub(r"\s+", " ", LEAKED.sub(" ", text)).strip()
+    m = re.search(r"<(search|graph|answer)>", text)
+    if not limit or not m:
+        return text
+    thought, call = text[: m.start()].strip(), text[m.start():]
+    sents = re.split(r"(?<=[.!?])\s+", thought)
+    kept = []
+    for snt in reversed(sents):
+        if kept and len(" ".join([snt] + kept)) > limit:
+            break
+        kept.insert(0, snt)
+    short = " ".join(kept)[-limit:].strip()
+    return f"{short} {call}".strip() if short else call
+
+
 def encode(r):
     """token ids + labels; labels are -100 except on assistant turns (incl. their end-of-turn token)"""
     msgs = [{"role": "system", "content": SYSTEM}, {"role": "user", "content": r["q"]}]
     for s in r["steps"]:
-        msgs.append({"role": "assistant", "content": s["text"]})
+        msgs.append({"role": "assistant", "content": trim_thought(s["text"], args.max_thought_chars)})
         if s.get("result") is not None:
             msgs.append({"role": "user", "content": render_result(s["result"], s.get("last", False))})
     ids, labels, prev = [], [], 0
