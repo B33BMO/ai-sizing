@@ -7,6 +7,7 @@ travels inside that stdin (never in argv or a file on srv).
 import io
 import json
 import os
+import shutil
 import runpy
 import shlex
 import subprocess
@@ -16,7 +17,7 @@ import urllib.request
 from urllib.parse import urlsplit
 
 DEVLOG = os.path.expanduser("~/.claude/skills/devlog/devlog")
-WSSH = os.path.expanduser("~/wssh/wssh")
+WSSH = shutil.which("wssh") or os.path.expanduser("~/wssh/wssh")  # srv: on PATH; Mac: zsh alias
 RELAY = r'''
 import sys, json, urllib.request, urllib.error
 e = json.load(sys.stdin)

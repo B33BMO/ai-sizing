@@ -8,11 +8,12 @@ newline-delimited JSON; `wssh ssh -N -R 7777:localhost:7777 bmo@windows` makes i
 """
 import json
 import os
+import shutil
 import socketserver
 import subprocess
 import threading
 
-WSSH = os.path.expanduser("~/wssh/wssh")
+WSSH = shutil.which("wssh") or os.path.expanduser("~/wssh/wssh")  # srv: on PATH; Mac: zsh alias
 CMD = ("cd /mnt/d/spero/365helper && SAGE_DB_PATH=$HOME/memlm-spero/sage.db "
        "exec npx tsx $HOME/memlm-spero/kb-serve.ts 2>/dev/null")
 lock = threading.Lock()
