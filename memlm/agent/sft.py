@@ -25,6 +25,8 @@ ap = argparse.ArgumentParser()
 ap.add_argument("--traces", required=True)
 ap.add_argument("--out", required=True)
 ap.add_argument("--init_adapter")
+ap.add_argument("--model", default=MODEL)
+ap.add_argument("--quant4", action="store_true", help="QLoRA: load the base in 4-bit NF4 (needed for 8B on 16 GB)")
 ap.add_argument("--exclude", default="data/spero_qa.json", help="never train on these (test) questions")
 ap.add_argument("--per_q", type=int, default=2)
 ap.add_argument("--max_thought_chars", type=int, default=0,
@@ -59,7 +61,8 @@ for q, rs in by_q.items():
             traces.append(r)
 print(f"{len(traces)} traces from {len(by_q)} questions")
 
-tok = AutoTokenizer.from_pretrained(MODEL)
+tok = AutoTokenizer.from_pretrained(args.model)
+TPL = {"enable_thinking": False}  # hybrid Qwen3 templates; ignored by templates that don't use it
 
 
 LEAKED = re.compile(r"</?think>|</?tool_call>")  # teacher/base-model markup that is not part of our protocol
@@ -89,14 +92,24 @@ def encode(r):
         msgs.append({"role": "assistant", "content": trim_thought(s["text"], args.max_thought_chars)})
         if s.get("result") is not None:
             msgs.append({"role": "user", "content": render_result(s["result"], s.get("last", False))})
-    ids, labels, prev = [], [], 0
-    for i in range(len(msgs)):
-        text = tok.apply_chat_template(msgs[: i + 1], tokenize=False, add_generation_prompt=False)
-        full = tok(text, add_special_tokens=False)["input_ids"]
-        new = full[prev:]
-        ids += new
-        labels += new if msgs[i]["role"] == "assistant" else [-100] * len(new)
-        prev = len(full)
+    # Render once and label assistant spans by character offsets. Rendering turn by turn is not
+    # prefix-stable for every template (Qwen3 hybrid drops the empty <think> block from older turns).
+    text = tok.apply_chat_template(msgs, tokenize=False, add_generation_prompt=False, **TPL)
+    enc = tok(text, add_special_tokens=False, return_offsets_mapping=True)
+    spans, i = [], 0
+    while True:
+        a = text.find("<|im_start|>assistant\n", i)
+        if a < 0:
+            break
+        start = a + len("<|im_start|>assistant\n")
+        empty_think = "<think>\n\n</think>\n\n"
+        if text.startswith(empty_think, start):  # the template's, not the model's: generation starts after it
+            start += len(empty_think)
+        end = text.find("<|im_end|>", start) + len("<|im_end|>")
+        spans.append((start, end))
+        i = end
+    ids = enc["input_ids"]
+    labels = [t if any(s <= o[0] < e for s, e in spans) else -100 for t, o in zip(ids, enc["offset_mapping"])]
     return ids[: args.max_len], labels[: args.max_len]
 
 
@@ -104,7 +117,12 @@ data = [encode(r) for r in traces]
 n_tok = sum(len(i) for i, _ in data)
 print(f"{n_tok/1e6:.2f}M tokens, {sum(sum(l != -100 for l in lab) for _, lab in data)/1e3:.0f}k trained tokens")
 
-model = AutoModelForCausalLM.from_pretrained(MODEL, dtype=torch.bfloat16, device_map="cuda")
+quant = {}
+if args.quant4:
+    from transformers import BitsAndBytesConfig
+    quant = {"quantization_config": BitsAndBytesConfig(load_in_4bit=True, bnb_4bit_quant_type="nf4",
+                                                         bnb_4bit_compute_dtype=torch.bfloat16, bnb_4bit_use_double_quant=True)}
+model = AutoModelForCausalLM.from_pretrained(args.model, dtype=torch.bfloat16, device_map="cuda", **quant)
 model.gradient_checkpointing_enable()
 model.enable_input_require_grads()
 if args.init_adapter:

@@ -52,11 +52,16 @@ class Tools:
         raise RuntimeError("kb bridge unreachable")
 
 
-def load(adapter=None, name=None):
+def load(adapter=None, name=None, quant4=False):
     name = name or MODEL
     tok = AutoTokenizer.from_pretrained(name)
     tok.padding_side = "left"
-    model = AutoModelForCausalLM.from_pretrained(name, dtype=torch.bfloat16, device_map="cuda")
+    quant = {}
+    if quant4:
+        from transformers import BitsAndBytesConfig
+        quant = {"quantization_config": BitsAndBytesConfig(load_in_4bit=True, bnb_4bit_quant_type="nf4",
+                                                             bnb_4bit_compute_dtype=torch.bfloat16, bnb_4bit_use_double_quant=True)}
+    model = AutoModelForCausalLM.from_pretrained(name, dtype=torch.bfloat16, device_map="cuda", **quant)
     model.thinking = "Thinking" in name  # chat template opens <think>: replies are thinking, </think>, action
     if adapter:
         from peft import PeftModel
@@ -93,7 +98,8 @@ def generate(tok, model, convs, max_new=256, temp=0.0, prefixes=None):
     """-> (actions, thoughts). prefixes: text the assistant turn is forced to start with."""
     """prefixes: text the assistant turn is forced to start with (e.g. "<answer>" on the last turn)"""
     prefixes = prefixes or [""] * len(convs)
-    texts = [tok.apply_chat_template(c, tokenize=False, add_generation_prompt=True) + p for c, p in zip(convs, prefixes)]
+    texts = [tok.apply_chat_template(c, tokenize=False, add_generation_prompt=True, enable_thinking=False) + p
+             for c, p in zip(convs, prefixes)]
     enc = tok(texts, return_tensors="pt", padding=True).to("cuda")
     sample = {"do_sample": True, "temperature": temp, "top_p": 0.95} if temp > 0 else {"do_sample": False}
     thinking = getattr(model, "thinking", False)
@@ -170,6 +176,7 @@ if __name__ == "__main__":
     ap.add_argument("--out", required=True)
     ap.add_argument("--adapter")
     ap.add_argument("--model", default=MODEL, help="e.g. Qwen/Qwen3-4B-Thinking-2507")
+    ap.add_argument("--quant4", action="store_true", help="load the base in 4-bit NF4 (8B on 16 GB)")
     ap.add_argument("--mode", default="tools", choices=["tools", "closed"])
     ap.add_argument("--limit", type=int, default=0)
     ap.add_argument("--bs", type=int, default=8)
@@ -181,7 +188,7 @@ if __name__ == "__main__":
     a = ap.parse_args()
     os.makedirs(os.path.dirname(a.out), exist_ok=True)
     qs = json.load(open(a.questions))
-    tok, model = load(a.adapter, a.model)
+    tok, model = load(a.adapter, a.model, a.quant4)
     qs = qs[: a.limit] if a.limit else qs
     if a.attempts > 1:  # one output file per attempt, so resume logic works per attempt
         for k in range(a.attempts):
