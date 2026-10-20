@@ -116,7 +116,7 @@ def generate(tok, model, convs, max_new=256, temp=0.0, prefixes=None):
     return res, thoughts
 
 
-def run(tok, model, items, mode, out_path, bs, max_turns=5, temp=0.0, max_new=256, force_answer=True):
+def run(tok, model, items, mode, out_path, bs, max_turns=5, temp=0.0, max_new=256, force_answer=True, memory=None, mem_k=3):
     tools = Tools() if mode == "tools" else None
     done = set()
     if os.path.exists(out_path):
@@ -128,7 +128,9 @@ def run(tok, model, items, mode, out_path, bs, max_turns=5, temp=0.0, max_new=25
     for b in range(0, len(items), bs):
         batch = items[b:b + bs]
         sys_prompt = SYSTEM if mode == "tools" else CLOSED
-        convs = [[{"role": "system", "content": sys_prompt}, {"role": "user", "content": it["q"]}] for it in batch]
+        recalled = [memory.render(it["q"], mem_k) if memory else ("", []) for it in batch]
+        convs = [[{"role": "system", "content": sys_prompt}, {"role": "user", "content": pre + it["q"]}]
+                 for it, (pre, _) in zip(batch, recalled)]
         state = [{"steps": [], "answer": None, "open": True} for _ in batch]
         for turn in range(max_turns if mode == "tools" else 1):
             live = [i for i, s in enumerate(state) if s["open"]]
@@ -160,8 +162,12 @@ def run(tok, model, items, mode, out_path, bs, max_turns=5, temp=0.0, max_new=25
             ok = grade(st["answer"], it["answer"])
             n += 1
             n_ok += ok
-            f.write(json.dumps({"q": it["q"], "gold": it["answer"], "answer": st["answer"], "correct": ok,
-                                "turns": len(st["steps"]), "steps": st["steps"]}) + "\n")
+            rec = {"q": it["q"], "gold": it["answer"], "answer": st["answer"], "correct": ok,
+                   "turns": len(st["steps"]), "steps": st["steps"]}
+            if memory:  # did a recalled example already contain this question's answer?
+                rec["mem_answers"] = recalled[batch.index(it)][1]
+                rec["mem_has_gold"] = any(grade(a, it["answer"]) for a in rec["mem_answers"])
+            f.write(json.dumps(rec) + "\n")
         f.flush()
         print(f"{n}/{len(items)}  acc {n_ok / n:.1%}  ({(time.time() - t0) / n:.1f}s/q)", flush=True)
     rows = [json.loads(l) for l in open(out_path)]
@@ -182,6 +188,9 @@ if __name__ == "__main__":
     ap.add_argument("--bs", type=int, default=8)
     ap.add_argument("--temp", type=float, default=0.0, help=">0 samples (for expert-iteration attempts)")
     ap.add_argument("--no_force_answer", action="store_true", help="don't pre-fill <answer> on the final turn")
+    ap.add_argument("--memory", help="experience memory: comma-separated trace files of solved (training) questions")
+    ap.add_argument("--mem_k", type=int, default=3)
+    ap.add_argument("--mem_hide_answers", action="store_true", help="control: show procedures, mask answers")
     ap.add_argument("--max_new", type=int, default=768,
                     help="tokens per turn; GLM-style reasoning overflowed 256 and lost the tool tag")
     ap.add_argument("--attempts", type=int, default=1, help="repeat each question this many times (with --temp)")
@@ -189,11 +198,17 @@ if __name__ == "__main__":
     os.makedirs(os.path.dirname(a.out), exist_ok=True)
     qs = json.load(open(a.questions))
     tok, model = load(a.adapter, a.model, a.quant4)
+    mem = None
+    if a.memory:
+        from experience import ExperienceMemory
+        mem = ExperienceMemory(a.memory, exclude_questions={it["q"] for it in qs}, hide_answers=a.mem_hide_answers)
+        print(f"experience memory: {len(mem.items)} solved questions", flush=True)
     qs = qs[: a.limit] if a.limit else qs
     if a.attempts > 1:  # one output file per attempt, so resume logic works per attempt
         for k in range(a.attempts):
             torch.manual_seed(k)
             run(tok, model, qs, a.mode, a.out.replace(".jsonl", f".a{k}.jsonl"), a.bs, temp=a.temp, max_new=a.max_new,
-                force_answer=not a.no_force_answer)
+                force_answer=not a.no_force_answer, memory=mem, mem_k=a.mem_k)
     else:
-        run(tok, model, qs, a.mode, a.out, a.bs, temp=a.temp, max_new=a.max_new, force_answer=not a.no_force_answer)
+        run(tok, model, qs, a.mode, a.out, a.bs, temp=a.temp, max_new=a.max_new, force_answer=not a.no_force_answer,
+            memory=mem, mem_k=a.mem_k)

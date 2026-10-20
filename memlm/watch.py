@@ -207,7 +207,8 @@ def agent_panel():
              "r1_tools": "4B round 1", "r1f_tools": "4B round 1 + forced answer", "r2_tools": "4B round 2",
              "r3b_tools": "4B round 3b (GLM traces)", "r3bf_tools": "4B round 3b + forced answer",
              "r3b8f_tools": "8B round 3b + forced answer (template bug)",
-             "r3b8pf_tools": "8B round 3b + forced answer (per-turn SFT)"}
+             "r3b8pf_tools": "8B round 3b + forced answer (per-turn SFT)",
+             "r3bm_tools": "4B round 3b + experience memory", "r3bmh_tools": "4B round 3b + memory, answers hidden"}
     order = {"base_closed": 0, "base_tools": 1}  # then rounds in name order (r1, r1f, r2, ...)
     files = sorted(glob.glob(f"{AGENT_DIR}/*_tools.jsonl") + glob.glob(f"{AGENT_DIR}/*_closed.jsonl"),
                    key=lambda f: (order.get(os.path.basename(f)[:-6], 2), os.path.basename(f)))
