@@ -201,8 +201,12 @@ def agent_panel():
     score = Table(box=box.SIMPLE, expand=True, header_style="bold cyan")
     for col, j in [("model / setting", "left"), ("Spero QA (test)", "right"), ("n", "right"), ("no answer", "right")]:
         score.add_column(col, justify=j, no_wrap=True)
-    names = {"base_closed": "Qwen3-4B, closed-book", "base_tools": "Qwen3-4B + tools (untrained)",
-             "r1_tools": "round 1", "r1f_tools": "round 1 + forced answer"}
+    names = {"base_closed": "4B, closed-book", "base_tools": "4B + tools, untrained (v1 protocol)",
+             "base2_tools": "4B + tools, untrained", "think_tools": "4B-Thinking, untrained",
+             "base8_tools": "8B (4-bit) + tools, untrained",
+             "r1_tools": "4B round 1", "r1f_tools": "4B round 1 + forced answer", "r2_tools": "4B round 2",
+             "r3b_tools": "4B round 3b (GLM traces)", "r3bf_tools": "4B round 3b + forced answer",
+             "r3b8f_tools": "8B round 3b + forced answer"}
     order = {"base_closed": 0, "base_tools": 1}  # then rounds in name order (r1, r1f, r2, ...)
     files = sorted(glob.glob(f"{AGENT_DIR}/*_tools.jsonl") + glob.glob(f"{AGENT_DIR}/*_closed.jsonl"),
                    key=lambda f: (order.get(os.path.basename(f)[:-6], 2), os.path.basename(f)))
@@ -213,10 +217,11 @@ def agent_panel():
             continue
         acc = sum(r["correct"] for r in rows) / len(rows)
         label = names.get(key, re.sub(r"^r(\d+)_tools$", r"round \1", key))
-        score.add_row(label, f"[bold]{acc * 100:.1f}%[/]", str(len(rows)), str(sum(r["answer"] is None for r in rows)))
+        n = str(len(rows)) if len(rows) >= 500 else f"[yellow]{len(rows)} (partial)"
+        score.add_row(label, f"[bold]{acc * 100:.1f}%[/]", n, str(sum(r["answer"] is None for r in rows)))
     for name, acc in REFS:
         score.add_row(f"[dim]{name}", f"[dim]{acc * 100:.1f}%", "[dim]500", "")
-    return Panel(Group(work, score), title="[bold]agent: Qwen3-4B learning Spero's tools[/]", border_style="green")
+    return Panel(Group(work, score), title="[bold]agent: small Qwen models learning Spero's tools[/]", border_style="green")
 
 
 def build():
