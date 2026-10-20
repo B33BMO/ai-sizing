@@ -27,6 +27,10 @@ ap.add_argument("--out", required=True)
 ap.add_argument("--init_adapter")
 ap.add_argument("--model", default=MODEL)
 ap.add_argument("--quant4", action="store_true", help="QLoRA: load the base in 4-bit NF4 (needed for 8B on 16 GB)")
+ap.add_argument("--per_turn", action="store_true",
+                help="one example per assistant turn, prompt rendered exactly as at inference. Needed for templates "
+                     "that render history differently from the current turn (Qwen3 hybrid: only the last turn gets the "
+                     "empty <think> block, so single-sequence SFT teaches 'think block => answer now')")
 ap.add_argument("--exclude", default="data/spero_qa.json", help="never train on these (test) questions")
 ap.add_argument("--per_q", type=int, default=2)
 ap.add_argument("--max_thought_chars", type=int, default=0,
@@ -113,7 +117,25 @@ def encode(r):
     return ids[: args.max_len], labels[: args.max_len]
 
 
-data = [encode(r) for r in traces]
+def encode_per_turn(r):
+    """[(ids, labels)] one per assistant turn: inference-identical prompt + that turn's reply"""
+    msgs = [{"role": "system", "content": SYSTEM}, {"role": "user", "content": r["q"]}]
+    out = []
+    for s in r["steps"]:
+        prompt = tok.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True, **TPL)
+        reply = trim_thought(s["text"], args.max_thought_chars)
+        p_ids = tok(prompt, add_special_tokens=False)["input_ids"]
+        r_ids = tok(reply + "<|im_end|>", add_special_tokens=False)["input_ids"]
+        ids = (p_ids + r_ids)[-args.max_len:]
+        labels = ([-100] * len(p_ids) + r_ids)[-args.max_len:]
+        out.append((ids, labels))
+        msgs.append({"role": "assistant", "content": reply})
+        if s.get("result") is not None:
+            msgs.append({"role": "user", "content": render_result(s["result"], s.get("last", False))})
+    return out
+
+
+data = [ex for r in traces for ex in encode_per_turn(r)] if args.per_turn else [encode(r) for r in traces]
 n_tok = sum(len(i) for i, _ in data)
 print(f"{n_tok/1e6:.2f}M tokens, {sum(sum(l != -100 for l in lab) for _, lab in data)/1e3:.0f}k trained tokens")
 
