@@ -33,6 +33,7 @@ ap.add_argument("--per_turn", action="store_true",
                      "empty <think> block, so single-sequence SFT teaches 'think block => answer now')")
 ap.add_argument("--exclude", default="data/spero_qa.json", help="never train on these (test) questions")
 ap.add_argument("--per_q", type=int, default=2)
+ap.add_argument("--seed", type=int, default=0, help="data order + LoRA init (for repeat runs)")
 ap.add_argument("--max_thought_chars", type=int, default=0,
                 help="trim the reasoning before each tool call to its last sentences (0 = keep); a 4B copying "
                      "GLM-length thoughts rambles and never emits the tag")
@@ -44,7 +45,8 @@ ap.add_argument("--rank", type=int, default=32)
 ap.add_argument("--max_len", type=int, default=6144)
 ap.add_argument("--tokens_per_step", type=int, default=32768)
 args = ap.parse_args()
-random.seed(0)
+random.seed(args.seed)
+torch.manual_seed(args.seed)
 
 test_qs = {it["q"] for it in json.load(open(args.exclude))}
 by_q = defaultdict(list)

@@ -1,0 +1,3 @@
+# gpu | job name | command (runs in /work/memlm; write everything under /out/<job name>/)
+# Filled in once the 8B result is in. Examples of the shape:
+0 | r3b-4b-seed1 | python agent/sft.py --traces /work/data/glm53_train.short.jsonl --per_q 1 --max_thought_chars 300 --per_turn --seed 1 --out /out/r3b-4b-seed1/lora && python agent/student.py --questions /work/data/spero_qa.json --adapter /out/r3b-4b-seed1/lora --out /out/r3b-4b-seed1/test.jsonl --bs 8 --max_new 512

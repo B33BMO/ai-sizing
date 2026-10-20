@@ -3,3 +3,6 @@ runs/
 *.log
 __pycache__/
 .venv/
+jobpack/data/
+jobpack/out/
+jobpack/hf-cache/
