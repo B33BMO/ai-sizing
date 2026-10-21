@@ -15,7 +15,7 @@ import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer, StoppingCriteria, StoppingCriteriaList
 
 sys.path.insert(0, os.path.dirname(__file__))
-from protocol import SYSTEM, grade, render_result  # noqa: E402
+from protocol import SYSTEM, SYSTEM_NO_GRAPH, grade, render_result  # noqa: E402
 
 MODEL = "Qwen/Qwen3-4B-Instruct-2507"
 CLOSED = ("Answer the question about Microsoft 365 from memory. Reply with <answer>the shortest exact answer, "
@@ -116,7 +116,8 @@ def generate(tok, model, convs, max_new=256, temp=0.0, prefixes=None):
     return res, thoughts
 
 
-def run(tok, model, items, mode, out_path, bs, max_turns=5, temp=0.0, max_new=256, force_answer=True, memory=None, mem_k=3):
+def run(tok, model, items, mode, out_path, bs, max_turns=5, temp=0.0, max_new=256, force_answer=True, memory=None, mem_k=3,
+        system=SYSTEM):
     tools = Tools() if mode == "tools" else None
     done = set()
     if os.path.exists(out_path):
@@ -127,7 +128,7 @@ def run(tok, model, items, mode, out_path, bs, max_turns=5, temp=0.0, max_new=25
     t0 = time.time()
     for b in range(0, len(items), bs):
         batch = items[b:b + bs]
-        sys_prompt = SYSTEM if mode == "tools" else CLOSED
+        sys_prompt = system if mode == "tools" else CLOSED
         recalled = [memory.render(it["q"], mem_k) if memory else ("", []) for it in batch]
         convs = [[{"role": "system", "content": sys_prompt}, {"role": "user", "content": pre + it["q"]}]
                  for it, (pre, _) in zip(batch, recalled)]
@@ -190,6 +191,7 @@ if __name__ == "__main__":
     ap.add_argument("--no_force_answer", action="store_true", help="don't pre-fill <answer> on the final turn")
     ap.add_argument("--memory", help="experience memory: comma-separated trace files of solved (training) questions")
     ap.add_argument("--mem_k", type=int, default=3)
+    ap.add_argument("--no_graph", action="store_true", help="ablation: drop the graph tool from the system prompt")
     ap.add_argument("--mem_hide_answers", action="store_true", help="control: show procedures, mask answers")
     ap.add_argument("--max_new", type=int, default=768,
                     help="tokens per turn; GLM-style reasoning overflowed 256 and lost the tool tag")
@@ -211,4 +213,4 @@ if __name__ == "__main__":
                 force_answer=not a.no_force_answer, memory=mem, mem_k=a.mem_k)
     else:
         run(tok, model, qs, a.mode, a.out, a.bs, temp=a.temp, max_new=a.max_new, force_answer=not a.no_force_answer,
-            memory=mem, mem_k=a.mem_k)
+            memory=mem, mem_k=a.mem_k, system=SYSTEM_NO_GRAPH if a.no_graph else SYSTEM)

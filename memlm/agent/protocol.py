@@ -9,6 +9,11 @@ Each result arrives as <result>...</result>.
 Before each call, think in one or two short sentences. Use at most 4 calls.
 When you know the answer, reply with <answer>the shortest exact answer, such as a product, feature or setting name</answer>."""
 
+# ablation: the same protocol without the graph tool (it was used 3 times in 1,126+ calls)
+SYSTEM_NO_GRAPH = SYSTEM.replace(
+    "<graph>Entity Name</graph>  returns an entity's description and its relationships to other entities.\n", "")
+assert SYSTEM_NO_GRAPH != SYSTEM
+
 TOOLS_RE = re.compile(r"<(search|graph|answer)>(.*?)</\1>", re.S)
 MAX_RESULT_CHARS = 3500
 
