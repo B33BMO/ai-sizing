@@ -130,7 +130,8 @@ def fmt_eta(sec):
 # ---------------------------------------------------------------- agent (Spero tool-use training)
 AGENT_DIR = os.path.expanduser("~/memlm2/runs/agent")
 # reference models, fair-graded (agent/regrade.py: verbose answers reduced to the entity they commit to)
-REFS = [("gemma-31B + tools (round 1-2 teacher)", 0.538), ("GLM-5.3 + tools (Ollama Cloud; the target)", 0.660)]
+REFS = [("gemma-31B + tools (round 1-2 teacher)", 0.538), ("GLM-5.3-flash + tools (Spero's production model)", 0.622),
+        ("GLM-5.3 + tools (Ollama Cloud)", 0.660)]
 # GLM-5.3-flash (Spero's production model) is added once its run is fair-graded
 _rate = {}  # path -> (first_seen_time, first_count): progress rate measured while the dashboard runs
 _qcount = {}
@@ -210,7 +211,8 @@ def agent_panel():
              "r3b8f_tools": "8B round 3b + forced answer (template bug)",
              "r3b8pf_tools": "8B round 3b + forced answer (per-turn SFT)",
              "r3bm_tools": "4B round 3b + experience memory", "r3bmh_tools": "4B round 3b + memory, answers hidden",
-             "r3bptf_tools": "4B round 3b per-turn + forced answer", "r3bng_tools": "4B round 3b, no graph tool"}
+             "r3bptf_tools": "4B round 3b per-turn + forced answer", "r3bng_tools": "4B round 3b, no graph tool",
+             "basem_tools": "4B untrained + experience memory", "basemh_tools": "4B untrained + memory, answers hidden"}
     order = {"base_closed": 0, "base_tools": 1}  # then rounds in name order (r1, r1f, r2, ...)
     files = sorted(glob.glob(f"{AGENT_DIR}/*_tools.jsonl") + glob.glob(f"{AGENT_DIR}/*_closed.jsonl"),
                    key=lambda f: (order.get(os.path.basename(f)[:-6], 2), os.path.basename(f)))
