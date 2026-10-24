@@ -93,11 +93,38 @@ def split_think(t):
     return think.replace("<think>", "").strip(), act
 
 
+TOKEN_BUDGET = int(os.environ.get("GEN_TOKEN_BUDGET", "24000"))  # padded (prompt+new) tokens per generate() call
+
+
 @torch.no_grad()
 def generate(tok, model, convs, max_new=256, temp=0.0, prefixes=None):
-    """-> (actions, thoughts). prefixes: text the assistant turn is forced to start with."""
-    """prefixes: text the assistant turn is forced to start with (e.g. "<answer>" on the last turn)"""
+    """-> (actions, thoughts). prefixes: text the assistant turn is forced to start with (e.g. "<answer>").
+    Splits the batch so padded tokens stay under TOKEN_BUDGET: long agent conversations (experience memory +
+    4 tool results, ~7k tokens) x 8 otherwise spike attention memory past 16 GB, which WSL reports as
+    'CUDA driver error: out of memory' / 'device not ready'."""
     prefixes = prefixes or [""] * len(convs)
+    lens = [len(tok.apply_chat_template(c, tokenize=False, add_generation_prompt=True, enable_thinking=False)) // 3
+            for c in convs]  # ~3 chars per token: conservative estimate
+    if len(convs) > 1 and len(convs) * (max(lens) + max_new) > TOKEN_BUDGET:
+        res, thoughts, group = [None] * len(convs), [None] * len(convs), []
+
+        def flush():
+            acts, thinks = _generate(tok, model, [convs[i] for i in group], max_new, temp, [prefixes[i] for i in group])
+            for i, a, t in zip(group, acts, thinks):
+                res[i], thoughts[i] = a, t
+
+        for i in sorted(range(len(convs)), key=lambda i: lens[i]):
+            if group and (len(group) + 1) * (max(lens[j] for j in group + [i]) + max_new) > TOKEN_BUDGET:
+                flush()
+                group = []
+            group.append(i)
+        flush()
+        return res, thoughts
+    return _generate(tok, model, convs, max_new, temp, prefixes)
+
+
+@torch.no_grad()
+def _generate(tok, model, convs, max_new, temp, prefixes):
     texts = [tok.apply_chat_template(c, tokenize=False, add_generation_prompt=True, enable_thinking=False) + p
              for c, p in zip(convs, prefixes)]
     enc = tok(texts, return_tensors="pt", padding=True).to("cuda")
