@@ -24,6 +24,8 @@ sys.path.insert(0, os.path.dirname(__file__))
 from protocol import SYSTEM, SYSTEM_NO_GRAPH, grade, render_result  # noqa: E402
 
 STOPS = ["</search>", "</graph>", "</answer>"]
+_kf = os.path.expanduser("~/.vllm_key")
+API_KEY = open(_kf).read().strip() if os.path.exists(_kf) else None  # written by serve_vllm.sh
 TAG = re.compile(r"<(search|graph|answer)>(.*?)</\1>", re.S)
 
 
@@ -55,9 +57,10 @@ class Tools:
 async def complete(session, args, prompt):
     body = {"model": args.lora or args.model, "prompt": prompt, "max_tokens": args.max_new, "temperature": 0,
             "stop": STOPS, "include_stop_str_in_output": True, "skip_special_tokens": True}
+    headers = {"Authorization": f"Bearer {API_KEY}"} if API_KEY else {}
     for attempt in range(6):
         try:
-            async with session.post(f"{args.server}/v1/completions", json=body) as resp:
+            async with session.post(f"{args.server}/v1/completions", json=body, headers=headers) as resp:
                 data = await resp.json()
                 return data["choices"][0]["text"]
         except (aiohttp.ClientError, asyncio.TimeoutError, KeyError):
@@ -133,7 +136,8 @@ if __name__ == "__main__":
     ap.add_argument("--out", required=True)
     ap.add_argument("--model", default="Qwen/Qwen3-4B-Instruct-2507")
     ap.add_argument("--lora", help="LoRA name registered with the vLLM server (--lora-modules name=path)")
-    ap.add_argument("--server", default="http://127.0.0.1:8000")
+    _uf = os.path.expanduser("~/.vllm_url")  # written by serve_vllm.sh
+    ap.add_argument("--server", default=open(_uf).read().strip() if os.path.exists(_uf) else "http://127.0.0.1:8000")
     ap.add_argument("--concurrency", type=int, default=64)
     ap.add_argument("--max_new", type=int, default=512)
     ap.add_argument("--max_turns", type=int, default=5)
