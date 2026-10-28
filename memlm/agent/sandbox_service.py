@@ -146,7 +146,8 @@ def reaper():
         for b in stale:
             destroy(b, "idle")
         # also remove orphans from a previous run of this service
-        r = docker("ps", "-q", "--filter", "name=memlm-sb-", "--format", "{{.Names}}")
+        # NB: no -q here: `-q` prints container IDs and ignores --format, so every live box looked like an orphan
+        r = docker("ps", "--filter", "name=memlm-sb-", "--format", "{{.Names}}")
         with lock:
             known = set(boxes)
         for name in r.stdout.decode().split():
