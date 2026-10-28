@@ -52,6 +52,7 @@ def create(files):
         raise RuntimeError(f"docker run failed: {r.stderr.decode()[-300:] or 'no message'}")
     for path, content in files.items():
         write(bid, path, content)
+    print(f"{time.strftime('%H:%M:%S')} create {bid}", flush=True)
     return bid
 
 
@@ -88,7 +89,8 @@ def execute(bid, cmd):
     return out, code
 
 
-def destroy(bid):
+def destroy(bid, why="client"):
+    print(f"{time.strftime('%H:%M:%S')} destroy {bid} ({why})", flush=True)
     with lock:
         boxes.pop(bid, None)
     docker("rm", "-f", bid)
@@ -142,13 +144,14 @@ def reaper():
         with lock:
             stale = [b for b, t in boxes.items() if now - t > IDLE_S]
         for b in stale:
-            destroy(b)
+            destroy(b, "idle")
         # also remove orphans from a previous run of this service
         r = docker("ps", "-q", "--filter", "name=memlm-sb-", "--format", "{{.Names}}")
         with lock:
             known = set(boxes)
         for name in r.stdout.decode().split():
             if name not in known:
+                print(f"{time.strftime('%H:%M:%S')} reap orphan {name}", flush=True)
                 docker("rm", "-f", name)
 
 

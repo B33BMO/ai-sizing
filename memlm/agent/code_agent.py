@@ -1,9 +1,10 @@
 """Coding/bash agent episodes in the sandbox, graded by hidden tests.
 
-Each task (agent/code_tasks.py) gets a fresh sandbox with its files; the model works with:
-  <bash>command</bash>                    run a shell command, see stdout+stderr
-  <write path="file.py">content</write>   overwrite a file
-  <done/>                                 finish
+Each task (agent/code_tasks.py) gets a fresh sandbox with its files; the model works with markdown fences
+(XML-style tags like <bash> get swallowed by Ollama's server-side tool-call parser for GLM):
+  ```bash            run a shell command, see stdout+stderr
+  ```file x.py       overwrite a file with the block's content
+  DONE               finish
 After the episode the hidden test file is copied in and run; `passed` = all hidden tests pass.
 
 Backends:
@@ -23,15 +24,24 @@ import time
 import aiohttp
 
 CODE_SYSTEM = """You are working on a small Python project in the current directory.
-Tools - make exactly one call per message, then stop and wait for its result:
-<bash>command</bash>  runs a shell command (for example: ls, cat solution.py, python -m pytest -q) and returns its output.
-<write path="file.py">complete new file content</write>  overwrites the file with exactly that content.
-<done/>  when the task is complete.
+Make exactly one action per message, then stop and wait for its result.
+To run a shell command (for example ls, cat solution.py, python -m pytest -q), write:
+```bash
+<the command>
+```
+To replace solution.py, write the complete new file as a python block:
+```python
+<the complete new content of solution.py>
+```
+(To replace a different file, use ```file <path> instead of ```python.)
+When the task is complete, reply with DONE on its own line.
 Each result arrives as <result>...</result>.
-Before each call, think in one or two short sentences. Use at most 8 calls, and run the tests before finishing."""
-STOPS = ["</bash>", "</write>", "<done/>"]
-CALL_RE = re.compile(r'<bash>(?P<cmd>.*?)</bash>|<write path="(?P<path>[^"]+)">\n?(?P<content>.*?)</write>|<done/>', re.S)
-LAST_CALL = "No tool calls left: reply now with <done/>."
+Before each action, think in one or two short sentences. Use at most 8 actions, and run the tests before finishing."""
+STOPS = ["\n```\n"]  # end of a fenced action; DONE ends the turn by itself
+CALL_RE = re.compile(r"```bash\n(?P<cmd>.*?)\n```|```file[ \t]+(?P<path>[^\n`]+)\n(?P<content>.*?)\n```"
+                     r"|```python\n(?P<py>.*?)\n```|^\s*DONE\s*$", re.S | re.M)
+LAST_CALL = "No actions left: reply now with DONE."
+NUDGE = "No action found. Use a ```bash block, a ```python block (replaces solution.py), or reply DONE."
 MAX_RESULT = 3000
 SB_ADDR = ("192.168.1.248", 7790)
 
@@ -93,11 +103,9 @@ class Ollama:
                 async with session.post("https://ollama.com/api/chat", json=body,
                                         headers={"Authorization": f"Bearer {self.key}"}) as r:
                     out = (await r.json())["message"]["content"]
-                    # servers may drop the stop string: put the closing tag back if the call was cut there
-                    if "<bash>" in out and "</bash>" not in out:
-                        out += "</bash>"
-                    if "<write " in out and "</write>" not in out:
-                        out += "</write>"
+                    # the server strips the stop string: close a fence the stop cut off
+                    if out.count("```") % 2 == 1:
+                        out = out.rstrip() + "\n```"
                     return out
             except (aiohttp.ClientError, asyncio.TimeoutError, KeyError):
                 await asyncio.sleep(5 * 2 ** attempt)
@@ -105,9 +113,10 @@ class Ollama:
 
 
 def clean(text):
+    """drop leaked markup and anything after the first complete action"""
     text = re.sub(r"</?think>|</?tool_call>", " ", text).strip()
-    cut = min([text.find(s) + len(s) for s in STOPS if s in text] or [len(text)])
-    return text[:cut].strip()
+    m = CALL_RE.search(text)
+    return text[: m.end()].strip() if m else text
 
 
 async def episode(task, llm, session, max_calls):
@@ -121,11 +130,14 @@ async def episode(task, llm, session, max_calls):
         for turn in range(max_calls + 1):
             out = clean(await llm(session, msgs))
             m = list(CALL_RE.finditer(out))
-            if not m:
-                steps.append({"text": out, "tool": None})
-                break
-            call = m[-1]
-            if call.group(0) == "<done/>":
+            if not m:  # no recognizable action: correct the format (twice at most), like a real harness would
+                steps.append({"text": out, "tool": None, "result": NUDGE})
+                if sum(st["tool"] is None for st in steps) > 2:
+                    break
+                msgs += [{"role": "assistant", "content": out}, {"role": "user", "content": render(NUDGE)}]
+                continue
+            call = m[0]
+            if call.group("cmd") is None and call.group("path") is None and call.group("py") is None:  # DONE
                 steps.append({"text": out, "tool": "done"})
                 break
             if turn == max_calls:  # out of calls: stop without executing
@@ -136,17 +148,23 @@ async def episode(task, llm, session, max_calls):
                 r = await sb({"op": "exec", "id": bid, "cmd": arg})
                 result = r.get("text", "") + ("" if r.get("code", 0) == 0 else f"\n[exit code {r.get('code')}]")
             else:
-                kind, arg = "write", call.group("path")
-                r = await sb({"op": "write", "id": bid, "path": arg, "content": call.group("content")})
+                kind = "write"
+                arg = call.group("path").strip() if call.group("path") else "solution.py"
+                content = call.group("content") if call.group("path") else call.group("py")
+                r = await sb({"op": "write", "id": bid, "path": arg, "content": content + "\n"})
                 result = f"wrote {arg}" if r.get("ok") else r.get("text", "write failed")
             last = turn == max_calls - 1
             steps.append({"text": out, "tool": kind, "arg": arg, "result": result, "last": last})
             msgs += [{"role": "assistant", "content": out}, {"role": "user", "content": render(result, last)}]
         await sb({"op": "write", "id": bid, "path": "test_hidden.py", "content": task["hidden_tests"]})
-        g = await sb({"op": "exec", "id": bid, "cmd": "python -m pytest -q -p no:cacheprovider test_hidden.py 2>&1 | tail -3"})
-        passed = g.get("code") == 0
+        # exit code must come from pytest itself (an earlier `| tail` made every episode "pass")
+        g = await sb({"op": "exec", "id": bid, "cmd": "python -m pytest -q -p no:cacheprovider test_hidden.py"})
+        passed = g.get("ok") and g.get("code") == 0
+        infra = not g.get("ok") or "No such container" in g.get("text", "")
     finally:
         await sb({"op": "destroy", "id": bid})
+    if infra:
+        raise RuntimeError(f"infra_error (sandbox lost) on {task['id']}: {g.get('text', '')[:120]}")
     return {"id": task["id"], "type": task["type"], "q": task["prompt"], "passed": passed, "correct": passed,
             "turns": len(steps), "steps": steps, "grade_output": g.get("text", "")[-300:]}
 

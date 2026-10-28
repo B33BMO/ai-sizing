@@ -2,7 +2,7 @@
 257-problem MBPP-sanitized *test* split stays untouched for the regression check).
 
   implement: solution.py has the signature + description and raises NotImplementedError; test_solution.py shows
-             ONE test; grading runs ALL tests (hidden), so hard-coding the visible test doesn't pass.
+             all tests (MBPP's hidden tests sometimes need exact strings no description implies); graded by a copy.
   fix:       solution.py is the reference with one injected bug (operator swap, off-by-one, comparison flip…);
              the visible tests fail; grading runs all tests.
 Every task is checked in the sandbox: reference passes all tests, the starting state fails at least one.
@@ -158,9 +158,8 @@ def main(a):
             if not passes({"solution.py": s}, full_tests):
                 found.append((split, {"id": f"impl-{p['task_id']}", "type": "implement", "problem": p["task_id"],
                                    "prompt": f"Implement `{entry}` in solution.py so that it does what its docstring "
-                                             "says. One example test is in test_solution.py; your code will also be "
-                                             "checked against additional hidden tests.",
-                                   "files": {"solution.py": s, "test_solution.py": test_file(tests[:1], imports)},
+                                             "says and the tests in test_solution.py pass.",
+                                   "files": {"solution.py": s, "test_solution.py": full_tests},
                                    "hidden_tests": full_tests, "reference": code}))
         except (StopIteration, SyntaxError):
             pass
