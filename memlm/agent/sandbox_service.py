@@ -28,6 +28,7 @@ EXEC_TIMEOUT = 20
 MAX_OUT = 4000
 boxes = {}  # id -> last-used time
 lock = threading.Lock()
+build_lock = threading.Lock()
 
 
 def docker(*args, timeout=30, stdin=None):
@@ -41,6 +42,9 @@ def create(files):
         bid = "memlm-sb-" + uuid.uuid4().hex[:12]
         boxes[bid] = time.time()
     for attempt in range(3):  # `docker run` can fail silently when srv is busy: retry with backoff
+        if attempt == 0 or b"Unable to find image" in r.stderr:
+            with build_lock:
+                ensure_image()
         r = _run(bid)
         if r.returncode == 0:
             break
@@ -54,6 +58,18 @@ def create(files):
         write(bid, path, content)
     print(f"{time.strftime('%H:%M:%S')} create {bid}", flush=True)
     return bid
+
+
+BUILD_DIR = os.path.expanduser("~/memlm-spero/sandbox")  # Dockerfile for IMAGE
+
+
+def ensure_image():
+    """images on srv have been pruned before (docker image/system prune -a): rebuild if missing"""
+    if docker("image", "inspect", IMAGE).returncode != 0:
+        print(f"{time.strftime('%H:%M:%S')} image {IMAGE} missing: rebuilding", flush=True)
+        r = docker("build", "-q", "-t", IMAGE, BUILD_DIR, timeout=900)
+        if r.returncode != 0:
+            raise RuntimeError(f"rebuild failed: {r.stderr.decode()[-300:]}")
 
 
 def _run(bid):

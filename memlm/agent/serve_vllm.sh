@@ -1,11 +1,15 @@
 #!/bin/bash
 # vLLM server for agent/engine.py (separate venv: vLLM pins its own torch).
 #   agent/serve_vllm.sh                          base Qwen3-4B-Instruct-2507
-#   agent/serve_vllm.sh runs/agent/lora_r3b r3b  + a LoRA adapter served under the name "r3b"
+#   agent/serve_vllm.sh runs/agent/lora_r3b r3b [more_path name ...]  + LoRA adapters served by name
 # Prefix caching makes every agent turn reuse the cached conversation; bf16 4B + KV cache fits the 16 GB card.
 MODEL=${MODEL:-Qwen/Qwen3-4B-Instruct-2507}
 LORA=()
-[ -n "$1" ] && LORA=(--enable-lora --max-lora-rank 32 --lora-modules "${2:-adapter}=$1")
+# adapters as path/name pairs: serve_vllm.sh runs/agent/lora_r3b r3b runs/agent/lora_r3b_pt r3b_pt ...
+if [ -n "$1" ]; then
+  LORA=(--enable-lora --max-lora-rank 32 --max-loras 4 --lora-modules)
+  while [ -n "$1" ]; do LORA+=("${2:-adapter}=$1"); shift 2 || shift; done
+fi
 # Under WSL mirrored networking, vLLM's 127.0.0.1 listener accepted no connections (a plain server on the same
 # port worked), so bind the LAN address and require an API key (vLLM has no auth by default).
 # LAN address detected at start (DHCP has changed it before); engine.py reads ~/.vllm_url
