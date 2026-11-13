@@ -55,6 +55,9 @@ CALL_RE = re.compile(r"```bash\n(?P<cmd>.*?)\n```|```file[ \t]+(?P<path>[^\n`]+)
                      r"|```python\n(?P<py>.*?)\n```|^\s*DONE\s*$", re.S | re.M)
 EDIT_RE = re.compile(r"<<<<<<< SEARCH\n(?P<old>.*?)\n?=======\n(?P<new>.*?)\n?>>>>>>> REPLACE", re.S)
 LAST_CALL = "No actions left: reply now with DONE."
+UNSTICK = ("That change was already tried or changes nothing, and the tests still fail. Before your next action, "
+           "reason step by step: pick one failing test, work out by hand what the correct code returns and what the "
+           "current code returns, and find the line responsible. Then make a different change.")
 NUDGE = ("No action found. Use a ```bash block, an ```edit block, a ```python block (replaces solution.py), "
          "or reply DONE.")
 MAX_RESULT = 3000
@@ -94,9 +97,9 @@ class VLLM:
         self.key = open(kf).read().strip() if os.path.exists(kf) else None
         self.url = open(uf).read().strip() if os.path.exists(uf) else "http://127.0.0.1:8000"
 
-    async def __call__(self, session, msgs):
+    async def __call__(self, session, msgs, temperature=0):
         prompt = self.tok.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True, enable_thinking=False)
-        body = {"model": self.model, "prompt": prompt, "max_tokens": self.max_new, "temperature": 0,
+        body = {"model": self.model, "prompt": prompt, "max_tokens": self.max_new, "temperature": temperature,
                 "skip_special_tokens": True}
         if not self.thinking:
             body.update(stop=STOPS, include_stop_str_in_output=True)
@@ -115,7 +118,7 @@ class Ollama:
         self.model, self.max_new, self.think = a.model, a.max_new, a.teacher_think
         self.key = os.environ["OLLAMA_API_KEY"]
 
-    async def __call__(self, session, msgs):
+    async def __call__(self, session, msgs, temperature=None):  # (teacher keeps its own temperature)
         body = {"model": self.model, "messages": msgs, "stream": False, "think": self.think,
                 "options": {"temperature": 0.3, "num_predict": self.max_new}}
         if not self.think:  # a stop string would also fire on a fence inside the thinking and cut the reply off;
@@ -172,6 +175,17 @@ def apply_edit(content, edit, path):
             want = [ln.rstrip() for ln in want]
             hits = [i for i in range(len(lines) - len(want) + 1)
                     if [ln.rstrip() for ln in lines[i:i + len(want)]] == want]
+        if not hits:
+            # small models miscount indentation (v3 wrote 8 spaces for a 4-space line, 41 failed edits): match
+            # ignoring leading whitespace, then shift the replacement by the same indentation difference
+            hits = [i for i in range(len(lines) - len(want) + 1)
+                    if [ln.strip() for ln in lines[i:i + len(want)]] == [ln.strip() for ln in want]]
+            if len(hits) == 1:
+                ind = lambda s: len(s) - len(s.lstrip())
+                first = next(j for j, ln in enumerate(want) if ln.strip()) if any(ln.strip() for ln in want) else 0
+                delta = ind(lines[hits[0] + first]) - ind(want[first])
+                new = "\n".join((" " * delta + ln if delta > 0 else ln[min(-delta, ind(ln)):]) if ln.strip() else ln
+                                for ln in new.split("\n"))
         if len(hits) != 1:
             return None, (f"The SEARCH part was not found in {path}. Copy the lines exactly as they are "
                           f"(cat {path} to see them)." if not hits else
@@ -188,16 +202,18 @@ def clean(text):
     return text[: m.end()].strip() if m else text
 
 
-async def episode(task, llm, session, max_calls):
+async def episode(task, llm, session, max_calls, unstick=False):
     box = await sb({"op": "create", "files": task["files"]})
     if not box.get("ok"):
         raise RuntimeError(box)
     bid = box["id"]
     msgs = [{"role": "system", "content": CODE_SYSTEM}, {"role": "user", "content": task["prompt"]}]
     steps = []
+    tried, hot = set(), False  # --unstick: changes already made; sample (not greedy) right after getting stuck
     try:
         for turn in range(max_calls + 1):
-            raw = await llm(session, msgs)
+            raw = await llm(session, msgs, temperature=0.7 if hot else 0)
+            hot = False
             think, raw = split_think(raw)
             out = clean(raw)
             m = list(CALL_RE.finditer(out))
@@ -228,13 +244,19 @@ async def episode(task, llm, session, max_calls):
                                 else (None, f"Cannot edit {arg}: it does not exist."))
                 else:
                     new, err = (call.group("content") if call.group("path") else call.group("py")) + "\n", None
-                if err:
+                key = (kind, arg, call.group("edit") or call.group("content") or call.group("py"))
+                if unstick and (key in tried or (not err and new == before)):
+                    # greedy decoding copies its own failed attempt from the history (7x in a row seen): don't
+                    # run it again, ask for reasoning through one failing test, and sample the next turn
+                    result, hot = UNSTICK, True
+                elif err:
                     result = err
                 elif new == before:  # the model rewrote the file unchanged (seen looping 4x before DONE)
                     result = f"No change: {arg} already has exactly this content."
                 else:
                     r = await sb({"op": "write", "id": bid, "path": arg, "content": new})
                     result = f"{'edited' if kind == 'edit' else 'wrote'} {arg}" if r.get("ok") else r.get("text", "write failed")
+                tried.add(key)
             last = turn == max_calls - 1
             steps.append({"text": out, "tool": kind, "arg": arg, "result": result, "last": last, "think": think})
             msgs += [{"role": "assistant", "content": out}, {"role": "user", "content": render(result, last)}]
@@ -262,7 +284,7 @@ async def main(a):
     async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=900)) as session:
         async def run(t):
             async with sem:
-                return await episode(t, llm, session, a.max_calls)
+                return await episode(t, llm, session, a.max_calls, a.unstick)
         with open(a.out, "a") as f:
             for fut in asyncio.as_completed([run(t) for t in tasks]):
                 try:
@@ -294,6 +316,8 @@ if __name__ == "__main__":
     ap.add_argument("--base", help="tokenizer/base model when --model is a LoRA name")
     ap.add_argument("--max_calls", type=int, default=8)
     ap.add_argument("--max_new", type=int, default=1536)
+    ap.add_argument("--unstick", action="store_true",
+                    help="don't rerun a repeated or no-op change; ask for step-by-step reasoning; sample the next turn")
     ap.add_argument("--teacher_think", action="store_true",
                     help="ollama: let the teacher think (since ~Nov 2026 GLM-5.3 mostly skips visible reasoning)")
     ap.add_argument("--concurrency", type=int, default=16)

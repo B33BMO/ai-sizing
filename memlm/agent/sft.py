@@ -99,7 +99,10 @@ def trim_thought(text, limit, think=""):
     if not m:
         return re.sub(r"\s+", " ", text)
     # collapse whitespace in the reasoning only: the action (code!) must keep its newlines and indentation
-    thought, call = re.sub(r"\s+", " ", f"{think} {text[: m.start()]}").strip(), text[m.start():].strip()
+    # the teacher's thinking only stands in when it wrote no visible reasoning: joining both (v3) duplicated the
+    # thought ("Let me look at the files. I'll start by examining the files.") and taught the student to repeat itself
+    visible = text[: m.start()].strip()
+    thought, call = re.sub(r"\s+", " ", visible or think).strip(), text[m.start():].strip()
     sep = "\n" if args.task == "code" else " "  # code fences belong at the start of a line
     if not limit:
         return f"{thought}{sep}{call}".strip() if thought else call
