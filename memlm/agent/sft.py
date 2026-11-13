@@ -91,7 +91,7 @@ LEAKED = re.compile(r"</?think>|</?tool_call>")  # teacher/base-model markup tha
 def trim_thought(text, limit):
     """keep the tool call and only the last sentence(s) of the reasoning before it, up to limit chars"""
     text = LEAKED.sub(" ", text).strip()
-    m = re.search(r"```(?:bash|python|file)|^\s*DONE\s*$", text, re.M) if args.task == "code" else \
+    m = re.search(r"```(?:bash|python|file|edit)|^\s*DONE\s*$", text, re.M) if args.task == "code" else \
         re.search(r"<(search|graph|answer)>", text)
     if not m:
         return re.sub(r"\s+", " ", text)

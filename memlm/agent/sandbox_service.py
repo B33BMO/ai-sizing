@@ -8,6 +8,7 @@ tool service, LAN-only.
   {"op": "create", "files": {"path": "content", ...}}  -> {"ok": true, "id": "..."}
   {"op": "exec", "id": "...", "cmd": "pytest -q"}      -> {"ok": true, "text": "<stdout+stderr>", "code": 0}
   {"op": "write", "id": "...", "path": "x.py", "content": "..."} -> {"ok": true}
+  {"op": "read", "id": "...", "path": "x.py"}          -> {"ok": true, "content": "..."}  (untruncated, for edits)
   {"op": "destroy", "id": "..."}                       -> {"ok": true}
 """
 import base64
@@ -91,6 +92,15 @@ def write(bid, path, content):
         raise RuntimeError(r.stderr.decode()[-300:])
 
 
+def read(bid, path):
+    if path.startswith("/") or ".." in path.split("/"):
+        raise ValueError("paths must be relative to /work")
+    r = docker("exec", bid, "head", "-c", "200000", path)
+    if r.returncode != 0:
+        raise FileNotFoundError(r.stderr.decode()[-300:].strip())
+    return r.stdout.decode(errors="replace")
+
+
 def execute(bid, cmd):
     try:
         r = docker("exec", bid, "timeout", "-k", "2", str(EXEC_TIMEOUT), "sh", "-c", cmd, timeout=EXEC_TIMEOUT + 10)
@@ -127,6 +137,8 @@ def handle(req):
     if op == "write":
         write(bid, req["path"], req["content"])
         return {"ok": True}
+    if op == "read":
+        return {"ok": True, "content": read(bid, req["path"])}
     if op == "destroy":
         destroy(bid)
         return {"ok": True}

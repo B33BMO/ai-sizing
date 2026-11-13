@@ -3,7 +3,8 @@
 Each task (agent/code_tasks.py) gets a fresh sandbox with its files; the model works with markdown fences
 (XML-style tags like <bash> get swallowed by Ollama's server-side tool-call parser for GLM):
   ```bash            run a shell command, see stdout+stderr
-  ```file x.py       overwrite a file with the block's content
+  ```file x.py       overwrite a file with the block's content (```python = overwrite solution.py)
+  ```edit x.py       SEARCH/REPLACE blocks: change a few lines without retyping the file
   DONE               finish
 After the episode the hidden test file is copied in and run; `passed` = all hidden tests pass.
 
@@ -29,19 +30,32 @@ To run a shell command (for example ls, cat solution.py, python -m pytest -q), w
 ```bash
 <the command>
 ```
-To replace solution.py, write the complete new file as a python block:
+To change a few lines of a file (best for fixing a bug), write an edit block. The SEARCH part must match
+lines of the file exactly; they are replaced by the part after =======:
+```edit solution.py
+<<<<<<< SEARCH
+<the exact current lines>
+=======
+<the new lines>
+>>>>>>> REPLACE
+```
+To replace solution.py completely (best for writing new code), write the whole new file as a python block:
 ```python
 <the complete new content of solution.py>
 ```
 (To replace a different file, use ```file <path> instead of ```python.)
 When the task is complete, reply with DONE on its own line.
 Each result arrives as <result>...</result>.
-Before each action, think in one or two short sentences. Use at most 8 actions, and run the tests before finishing."""
+Before each action, think in one or two short sentences. If a change did not fix the tests, read the failure
+again before trying something else. Use at most 8 actions, and run the tests before finishing."""
 STOPS = ["\n```\n"]  # end of a fenced action; DONE ends the turn by itself
 CALL_RE = re.compile(r"```bash\n(?P<cmd>.*?)\n```|```file[ \t]+(?P<path>[^\n`]+)\n(?P<content>.*?)\n```"
+                     r"|```edit[ \t]+(?P<epath>[^\n`]+)\n(?P<edit>.*?)\n```"
                      r"|```python\n(?P<py>.*?)\n```|^\s*DONE\s*$", re.S | re.M)
+EDIT_RE = re.compile(r"<<<<<<< SEARCH\n(?P<old>.*?)\n?=======\n(?P<new>.*?)\n?>>>>>>> REPLACE", re.S)
 LAST_CALL = "No actions left: reply now with DONE."
-NUDGE = "No action found. Use a ```bash block, a ```python block (replaces solution.py), or reply DONE."
+NUDGE = ("No action found. Use a ```bash block, an ```edit block, a ```python block (replaces solution.py), "
+         "or reply DONE.")
 MAX_RESULT = 3000
 SB_ADDR = ("192.168.1.248", 7790)
 
@@ -125,6 +139,32 @@ def split_think(text):
     return "", text
 
 
+def apply_edit(content, edit, path):
+    """apply SEARCH/REPLACE blocks -> (new content, None) or (None, error message for the model)"""
+    blocks = list(EDIT_RE.finditer(edit))
+    if not blocks:
+        return None, "Edit not understood: write <<<<<<< SEARCH, the exact lines, =======, the new lines, >>>>>>> REPLACE."
+    for b in blocks:
+        old, new = b.group("old"), b.group("new")
+        if not old.strip():
+            return None, "The SEARCH part is empty: copy the lines to replace from the file."
+        # match whole lines only (a substring match once spliced a partial line); exact first, then ignoring
+        # trailing whitespace
+        lines, want = content.split("\n"), old.split("\n")
+        hits = [i for i in range(len(lines) - len(want) + 1) if lines[i:i + len(want)] == want]
+        if not hits:
+            want = [ln.rstrip() for ln in want]
+            hits = [i for i in range(len(lines) - len(want) + 1)
+                    if [ln.rstrip() for ln in lines[i:i + len(want)]] == want]
+        if len(hits) != 1:
+            return None, (f"The SEARCH part was not found in {path}. Copy the lines exactly as they are "
+                          f"(cat {path} to see them)." if not hits else
+                          f"The SEARCH part matches {len(hits)} places in {path}: include more lines.")
+        i = hits[0]
+        content = "\n".join(lines[:i] + new.split("\n") + lines[i + len(want):])
+    return content, None
+
+
 def clean(text):
     """drop leaked markup and anything after the first complete action"""
     text = re.sub(r"</?think>|</?tool_call>", " ", text).strip()
@@ -152,7 +192,7 @@ async def episode(task, llm, session, max_calls):
                 msgs += [{"role": "assistant", "content": out}, {"role": "user", "content": render(NUDGE)}]
                 continue
             call = m[0]
-            if call.group("cmd") is None and call.group("path") is None and call.group("py") is None:  # DONE
+            if all(call.group(g) is None for g in ("cmd", "path", "py", "epath")):  # DONE
                 steps.append({"text": out, "tool": "done", "think": think})
                 break
             if turn == max_calls:  # out of calls: stop without executing
@@ -163,11 +203,22 @@ async def episode(task, llm, session, max_calls):
                 r = await sb({"op": "exec", "id": bid, "cmd": arg})
                 result = r.get("text", "") + ("" if r.get("code", 0) == 0 else f"\n[exit code {r.get('code')}]")
             else:
-                kind = "write"
-                arg = call.group("path").strip() if call.group("path") else "solution.py"
-                content = call.group("content") if call.group("path") else call.group("py")
-                r = await sb({"op": "write", "id": bid, "path": arg, "content": content + "\n"})
-                result = f"wrote {arg}" if r.get("ok") else r.get("text", "write failed")
+                kind = "edit" if call.group("epath") else "write"
+                arg = (call.group("epath") or call.group("path") or "solution.py").strip()
+                cur = await sb({"op": "read", "id": bid, "path": arg})
+                before = cur.get("content") if cur.get("ok") else None
+                if kind == "edit":
+                    new, err = (apply_edit(before, call.group("edit"), arg) if before is not None
+                                else (None, f"Cannot edit {arg}: it does not exist."))
+                else:
+                    new, err = (call.group("content") if call.group("path") else call.group("py")) + "\n", None
+                if err:
+                    result = err
+                elif new == before:  # the model rewrote the file unchanged (seen looping 4x before DONE)
+                    result = f"No change: {arg} already has exactly this content."
+                else:
+                    r = await sb({"op": "write", "id": bid, "path": arg, "content": new})
+                    result = f"{'edited' if kind == 'edit' else 'wrote'} {arg}" if r.get("ok") else r.get("text", "write failed")
             last = turn == max_calls - 1
             steps.append({"text": out, "tool": kind, "arg": arg, "result": result, "last": last, "think": think})
             msgs += [{"role": "assistant", "content": out}, {"role": "user", "content": render(result, last)}]
