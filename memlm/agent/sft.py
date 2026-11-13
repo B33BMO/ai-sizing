@@ -88,15 +88,18 @@ TPL = {"enable_thinking": False}  # hybrid Qwen3 templates; ignored by templates
 LEAKED = re.compile(r"</?think>|</?tool_call>")  # teacher/base-model markup that is not part of our protocol
 
 
-def trim_thought(text, limit):
-    """keep the tool call and only the last sentence(s) of the reasoning before it, up to limit chars"""
+def trim_thought(text, limit, think=""):
+    """keep the tool call and only the last sentence(s) of the reasoning before it, up to limit chars.
+    `think`: the teacher's separate thinking (Ollama think=True), prepended to the visible reasoning; its code
+    blocks are dropped so fences inside it can't be mistaken for the action"""
     text = LEAKED.sub(" ", text).strip()
+    think = LEAKED.sub(" ", re.sub(r"```.*?(```|$)", " ", think or "", flags=re.S)).strip()
     m = re.search(r"```(?:bash|python|file|edit)|^\s*DONE\s*$", text, re.M) if args.task == "code" else \
         re.search(r"<(search|graph|answer)>", text)
     if not m:
         return re.sub(r"\s+", " ", text)
     # collapse whitespace in the reasoning only: the action (code!) must keep its newlines and indentation
-    thought, call = re.sub(r"\s+", " ", text[: m.start()]).strip(), text[m.start():].strip()
+    thought, call = re.sub(r"\s+", " ", f"{think} {text[: m.start()]}").strip(), text[m.start():].strip()
     sep = "\n" if args.task == "code" else " "  # code fences belong at the start of a line
     if not limit:
         return f"{thought}{sep}{call}".strip() if thought else call
@@ -114,7 +117,7 @@ def encode(r):
     """token ids + labels; labels are -100 except on assistant turns (incl. their end-of-turn token)"""
     msgs = [{"role": "system", "content": SYSTEM}, {"role": "user", "content": r["q"]}]
     for s in r["steps"]:
-        msgs.append({"role": "assistant", "content": trim_thought(s["text"], args.max_thought_chars)})
+        msgs.append({"role": "assistant", "content": trim_thought(s["text"], args.max_thought_chars, s.get("think"))})
         if s.get("result") is not None:
             msgs.append({"role": "user", "content": render_result(s["result"], s.get("last", False))})
     # Render once and label assistant spans by character offsets. Rendering turn by turn is not
@@ -144,7 +147,7 @@ def encode_per_turn(r):
     out = []
     for s in r["steps"]:
         prompt = tok.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True, **TPL)
-        reply = trim_thought(s["text"], args.max_thought_chars)
+        reply = trim_thought(s["text"], args.max_thought_chars, s.get("think"))
         p_ids = tok(prompt, add_special_tokens=False)["input_ids"]
         r_ids = tok(reply + "<|im_end|>", add_special_tokens=False)["input_ids"]
         ids = (p_ids + r_ids)[-args.max_len:]

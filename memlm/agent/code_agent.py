@@ -46,8 +46,9 @@ To replace solution.py completely (best for writing new code), write the whole n
 (To replace a different file, use ```file <path> instead of ```python.)
 When the task is complete, reply with DONE on its own line.
 Each result arrives as <result>...</result>.
-Before each action, think in one or two short sentences. If a change did not fix the tests, read the failure
-again before trying something else. Use at most 8 actions, and run the tests before finishing."""
+Start every message with one or two sentences of reasoning: what the last result showed and what you will do
+next and why. Then write the action. If a change did not fix the tests, read the failure again before trying
+something else. Use at most 8 actions, and run the tests before finishing."""
 STOPS = ["\n```\n"]  # end of a fenced action; DONE ends the turn by itself
 CALL_RE = re.compile(r"```bash\n(?P<cmd>.*?)\n```|```file[ \t]+(?P<path>[^\n`]+)\n(?P<content>.*?)\n```"
                      r"|```edit[ \t]+(?P<epath>[^\n`]+)\n(?P<edit>.*?)\n```"
@@ -111,21 +112,36 @@ class VLLM:
 
 class Ollama:
     def __init__(self, a):
-        self.model, self.max_new = a.model, a.max_new
+        self.model, self.max_new, self.think = a.model, a.max_new, a.teacher_think
         self.key = os.environ["OLLAMA_API_KEY"]
 
     async def __call__(self, session, msgs):
-        body = {"model": self.model, "messages": msgs, "stream": False, "think": False,
-                "options": {"temperature": 0.3, "num_predict": self.max_new, "stop": STOPS}}
+        body = {"model": self.model, "messages": msgs, "stream": False, "think": self.think,
+                "options": {"temperature": 0.3, "num_predict": self.max_new}}
+        if not self.think:  # a stop string would also fire on a fence inside the thinking and cut the reply off;
+            body["options"]["stop"] = STOPS  # with thinking, clean() keeps the first action instead
         for attempt in range(6):
             try:
                 async with session.post("https://ollama.com/api/chat", json=body,
                                         headers={"Authorization": f"Bearer {self.key}"}) as r:
-                    out = (await r.json())["message"]["content"]
-                    # the server strips the stop string: close a fence the stop cut off
-                    if out.count("```") % 2 == 1:
-                        out = out.rstrip() + "\n```"
-                    return out
+                    msg = (await r.json())["message"]
+                    out, think = msg["content"], msg.get("thinking") or ""
+                    if not self.think:
+                        # the server strips the stop string: close a fence the stop cut off
+                        if out.count("```") % 2 == 1:
+                            out = out.rstrip() + "\n```"
+                        return out
+                    # Ollama's GLM parser leaves stray </think> tags in the content (and sometimes the thinking), often
+                    # right before the action, eating its opening ```: turn them into newlines, then restore the fence
+                    think = think.replace("</think>", " ")
+                    out = re.sub(r"\s*</think>\s*", "\n", out)
+                    bare = re.search(r"(?m)^(bash|python|(?:edit|file)[ \t]+[^\n`]+)$", out)
+                    fence = re.search(r"```(bash|python|edit|file)", out)  # (may be a later, hallucinated turn)
+                    if bare and (not fence or bare.start() < fence.start()):
+                        out = out[: bare.start()] + "```" + out[bare.start():]
+                    # the teacher's thinking travels as <think>...</think>: split_think stores it per step and keeps it
+                    # out of the conversation; sft.py uses its tail as the thought before the action
+                    return f"<think>{think}</think>{out}" if think else out
             except (aiohttp.ClientError, asyncio.TimeoutError, KeyError):
                 await asyncio.sleep(5 * 2 ** attempt)
         raise RuntimeError("Ollama unreachable")
@@ -278,6 +294,8 @@ if __name__ == "__main__":
     ap.add_argument("--base", help="tokenizer/base model when --model is a LoRA name")
     ap.add_argument("--max_calls", type=int, default=8)
     ap.add_argument("--max_new", type=int, default=1536)
+    ap.add_argument("--teacher_think", action="store_true",
+                    help="ollama: let the teacher think (since ~Nov 2026 GLM-5.3 mostly skips visible reasoning)")
     ap.add_argument("--concurrency", type=int, default=16)
     ap.add_argument("--limit", type=int, default=0)
     asyncio.run(main(ap.parse_args()))
