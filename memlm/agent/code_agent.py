@@ -71,6 +71,9 @@ class VLLM:
     def __init__(self, a):
         from transformers import AutoTokenizer
         self.model, self.max_new = a.model, a.max_new
+        # thinking models write fences inside <think>, so no stop strings: generate freely, then take the first
+        # action after </think> (see split_think)
+        self.thinking = "Thinking" in (a.base or a.model)
         self.tok = AutoTokenizer.from_pretrained(a.base or a.model)
         kf, uf = os.path.expanduser("~/.vllm_key"), os.path.expanduser("~/.vllm_url")
         self.key = open(kf).read().strip() if os.path.exists(kf) else None
@@ -78,8 +81,10 @@ class VLLM:
 
     async def __call__(self, session, msgs):
         prompt = self.tok.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True, enable_thinking=False)
-        body = {"model": self.model, "prompt": prompt, "max_tokens": self.max_new, "temperature": 0, "stop": STOPS,
-                "include_stop_str_in_output": True, "skip_special_tokens": True}
+        body = {"model": self.model, "prompt": prompt, "max_tokens": self.max_new, "temperature": 0,
+                "skip_special_tokens": True}
+        if not self.thinking:
+            body.update(stop=STOPS, include_stop_str_in_output=True)
         hdr = {"Authorization": f"Bearer {self.key}"} if self.key else {}
         for attempt in range(6):
             try:
@@ -112,6 +117,14 @@ class Ollama:
         raise RuntimeError("Ollama unreachable")
 
 
+def split_think(text):
+    """-> (thinking, visible). Qwen3 thinking templates open <think> in the prompt, so outputs carry only </think>."""
+    if "</think>" in text:
+        think, vis = text.rsplit("</think>", 1)
+        return think.replace("<think>", "").strip(), vis
+    return "", text
+
+
 def clean(text):
     """drop leaked markup and anything after the first complete action"""
     text = re.sub(r"</?think>|</?tool_call>", " ", text).strip()
@@ -128,20 +141,22 @@ async def episode(task, llm, session, max_calls):
     steps = []
     try:
         for turn in range(max_calls + 1):
-            out = clean(await llm(session, msgs))
+            raw = await llm(session, msgs)
+            think, raw = split_think(raw)
+            out = clean(raw)
             m = list(CALL_RE.finditer(out))
             if not m:  # no recognizable action: correct the format (twice at most), like a real harness would
-                steps.append({"text": out, "tool": None, "result": NUDGE})
+                steps.append({"text": out, "tool": None, "result": NUDGE, "think": think})
                 if sum(st["tool"] is None for st in steps) > 2:
                     break
                 msgs += [{"role": "assistant", "content": out}, {"role": "user", "content": render(NUDGE)}]
                 continue
             call = m[0]
             if call.group("cmd") is None and call.group("path") is None and call.group("py") is None:  # DONE
-                steps.append({"text": out, "tool": "done"})
+                steps.append({"text": out, "tool": "done", "think": think})
                 break
             if turn == max_calls:  # out of calls: stop without executing
-                steps.append({"text": out, "tool": "over_limit"})
+                steps.append({"text": out, "tool": "over_limit", "think": think})
                 break
             if call.group("cmd") is not None:
                 kind, arg = "bash", call.group("cmd").strip()
@@ -154,7 +169,7 @@ async def episode(task, llm, session, max_calls):
                 r = await sb({"op": "write", "id": bid, "path": arg, "content": content + "\n"})
                 result = f"wrote {arg}" if r.get("ok") else r.get("text", "write failed")
             last = turn == max_calls - 1
-            steps.append({"text": out, "tool": kind, "arg": arg, "result": result, "last": last})
+            steps.append({"text": out, "tool": kind, "arg": arg, "result": result, "last": last, "think": think})
             msgs += [{"role": "assistant", "content": out}, {"role": "user", "content": render(result, last)}]
         await sb({"op": "write", "id": bid, "path": "test_hidden.py", "content": task["hidden_tests"]})
         # exit code must come from pytest itself (an earlier `| tail` made every episode "pass")
