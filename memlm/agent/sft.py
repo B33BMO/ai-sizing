@@ -19,6 +19,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 
 sys.path.insert(0, os.path.dirname(__file__))
 from protocol import SYSTEM, has_duplicate_calls, render_result  # noqa: E402
+import code_agent  # noqa: E402  (coding protocol: CODE_SYSTEM, fenced actions, render)
 from student import MODEL  # noqa: E402
 
 ap = argparse.ArgumentParser()
@@ -39,6 +40,8 @@ ap.add_argument("--max_thought_chars", type=int, default=0,
                      "GLM-length thoughts rambles and never emits the tag")
 ap.add_argument("--max_answer_words", type=int, default=10,
                 help="drop traces whose final answer is longer (the grader's contains-match would reward padding)")
+ap.add_argument("--task", default="spero", choices=["spero", "code"],
+                help="code: coding-agent traces (CODE_SYSTEM, fenced actions; keyed by task id, not prompt text)")
 ap.add_argument("--epochs", type=float, default=2)
 ap.add_argument("--lr", type=float, default=1e-4)
 ap.add_argument("--rank", type=int, default=32)
@@ -48,14 +51,25 @@ args = ap.parse_args()
 random.seed(args.seed)
 torch.manual_seed(args.seed)
 
-test_qs = {it["q"] for it in json.load(open(args.exclude))}
+if args.task == "code":
+    SYSTEM, render_result = code_agent.CODE_SYSTEM, code_agent.render
+    test_ids = {t["id"] for t in json.load(open("data/code_tasks.json"))["test"]}
+    def keep(r):  # passed, ended with DONE, no format nudges (clean actions only), not a test task
+        return (r["passed"] and r["id"] not in test_ids and r["steps"] and r["steps"][-1].get("tool") == "done"
+                and all(s.get("tool") is not None for s in r["steps"]))
+    key_of = lambda r: r["id"]  # all fix tasks share one prompt text
+else:
+    test_qs = {it["q"] for it in json.load(open(args.exclude))}
+    def keep(r):
+        return (r["correct"] and r["q"] not in test_qs and r["steps"] and r["steps"][-1].get("tool") == "answer"
+                and not has_duplicate_calls(r["steps"]) and len((r.get("answer") or "").split()) <= args.max_answer_words)
+    key_of = lambda r: r["q"]
 by_q = defaultdict(list)
 for path in args.traces.split(","):
     for line in open(path):
         r = json.loads(line)
-        if (r["correct"] and r["q"] not in test_qs and r["steps"] and r["steps"][-1].get("tool") == "answer"
-                and not has_duplicate_calls(r["steps"]) and len((r.get("answer") or "").split()) <= args.max_answer_words):
-            by_q[r["q"]].append(r)
+        if keep(r):
+            by_q[key_of(r)].append(r)
 traces = []
 for q, rs in by_q.items():
     rs.sort(key=lambda r: r["turns"])
@@ -76,11 +90,16 @@ LEAKED = re.compile(r"</?think>|</?tool_call>")  # teacher/base-model markup tha
 
 def trim_thought(text, limit):
     """keep the tool call and only the last sentence(s) of the reasoning before it, up to limit chars"""
-    text = re.sub(r"\s+", " ", LEAKED.sub(" ", text)).strip()
-    m = re.search(r"<(search|graph|answer)>", text)
-    if not limit or not m:
-        return text
-    thought, call = text[: m.start()].strip(), text[m.start():]
+    text = LEAKED.sub(" ", text).strip()
+    m = re.search(r"```(?:bash|python|file)|^\s*DONE\s*$", text, re.M) if args.task == "code" else \
+        re.search(r"<(search|graph|answer)>", text)
+    if not m:
+        return re.sub(r"\s+", " ", text)
+    # collapse whitespace in the reasoning only: the action (code!) must keep its newlines and indentation
+    thought, call = re.sub(r"\s+", " ", text[: m.start()]).strip(), text[m.start():].strip()
+    sep = "\n" if args.task == "code" else " "  # code fences belong at the start of a line
+    if not limit:
+        return f"{thought}{sep}{call}".strip() if thought else call
     sents = re.split(r"(?<=[.!?])\s+", thought)
     kept = []
     for snt in reversed(sents):
@@ -88,7 +107,7 @@ def trim_thought(text, limit):
             break
         kept.insert(0, snt)
     short = " ".join(kept)[-limit:].strip()
-    return f"{short} {call}".strip() if short else call
+    return f"{short}{sep}{call}".strip() if short else call
 
 
 def encode(r):
