@@ -42,6 +42,8 @@ ap.add_argument("--max_answer_words", type=int, default=10,
                 help="drop traces whose final answer is longer (the grader's contains-match would reward padding)")
 ap.add_argument("--task", default="spero", choices=["spero", "code"],
                 help="code: coding-agent traces (CODE_SYSTEM, fenced actions; keyed by task id, not prompt text)")
+ap.add_argument("--self_traces", help="code: the student's own attempts (comma list); keeps one *recovery* per task "
+                "(a change, failing tests, a different change, pass); its wasted moves stay in context, loss off")
 ap.add_argument("--epochs", type=float, default=2)
 ap.add_argument("--lr", type=float, default=1e-4)
 ap.add_argument("--rank", type=int, default=32)
@@ -80,6 +82,35 @@ for q, rs in by_q.items():
             seen.add(key)
             traces.append(r)
 print(f"{len(traces)} traces from {len(by_q)} questions")
+
+# the student's wasted moves: kept in context (the recovery reacts to them) but never trained on
+WASTED = ("That change was already tried", "No change:", "The SEARCH part", "Edit not understood", "Cannot edit")
+wasted = lambda s: str(s.get("result", "")).startswith(WASTED)
+
+
+def is_recovery(r):
+    """a successful change, then a failing test run, then another successful change, and the task passes"""
+    seen_change = seen_fail = False
+    for s in r["steps"]:
+        ok_change = s.get("tool") in ("edit", "write") and str(s.get("result", "")).startswith(("edited", "wrote"))
+        if ok_change and seen_fail:
+            return True
+        seen_change |= ok_change
+        seen_fail |= seen_change and s.get("tool") == "bash" and "[exit code" in str(s.get("result", ""))
+    return False
+
+
+if args.self_traces:
+    mine = defaultdict(list)
+    for path in args.self_traces.split(","):
+        for line in open(path):
+            r = json.loads(line)
+            if keep(r) and is_recovery(r):
+                mine[r["id"]].append(r)
+    for rs in mine.values():
+        traces.append(min(rs, key=lambda r: r["turns"]))
+    print(f"+ {len(mine)} self-generated recovery traces "
+          f"({sum(wasted(s) for rs in mine.values() for s in min(rs, key=lambda r: r['turns'])['steps'])} wasted moves masked)")
 
 tok = AutoTokenizer.from_pretrained(args.model)
 TPL = {"enable_thinking": False}  # hybrid Qwen3 templates; ignored by templates that don't use it
@@ -128,6 +159,7 @@ def encode(r):
     text = tok.apply_chat_template(msgs, tokenize=False, add_generation_prompt=False, **TPL)
     enc = tok(text, add_special_tokens=False, return_offsets_mapping=True)
     spans, i = [], 0
+    trained = [not wasted(s) for s in r["steps"]]
     while True:
         a = text.find("<|im_start|>assistant\n", i)
         if a < 0:
@@ -139,6 +171,7 @@ def encode(r):
         end = text.find("<|im_end|>", start) + len("<|im_end|>")
         spans.append((start, end))
         i = end
+    spans = [sp for sp, t in zip(spans, trained) if t]  # assistant turns map 1:1 to steps
     ids = enc["input_ids"]
     labels = [t if any(s <= o[0] < e for s, e in spans) else -100 for t, o in zip(ids, enc["offset_mapping"])]
     return ids[: args.max_len], labels[: args.max_len]
@@ -155,7 +188,8 @@ def encode_per_turn(r):
         r_ids = tok(reply + "<|im_end|>", add_special_tokens=False)["input_ids"]
         ids = (p_ids + r_ids)[-args.max_len:]
         labels = ([-100] * len(p_ids) + r_ids)[-args.max_len:]
-        out.append((ids, labels))
+        if not wasted(s):
+            out.append((ids, labels))
         msgs.append({"role": "assistant", "content": reply})
         if s.get("result") is not None:
             msgs.append({"role": "user", "content": render_result(s["result"], s.get("last", False))})

@@ -202,7 +202,7 @@ def clean(text):
     return text[: m.end()].strip() if m else text
 
 
-async def episode(task, llm, session, max_calls, unstick=False):
+async def episode(task, llm, session, max_calls, unstick=False, temperature=0):
     box = await sb({"op": "create", "files": task["files"]})
     if not box.get("ok"):
         raise RuntimeError(box)
@@ -212,7 +212,7 @@ async def episode(task, llm, session, max_calls, unstick=False):
     tried, hot = set(), False  # --unstick: changes already made; sample (not greedy) right after getting stuck
     try:
         for turn in range(max_calls + 1):
-            raw = await llm(session, msgs, temperature=0.7 if hot else 0)
+            raw = await llm(session, msgs, temperature=max(0.7, temperature) if hot else temperature)
             hot = False
             think, raw = split_think(raw)
             out = clean(raw)
@@ -284,7 +284,7 @@ async def main(a):
     async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=900)) as session:
         async def run(t):
             async with sem:
-                return await episode(t, llm, session, a.max_calls, a.unstick)
+                return await episode(t, llm, session, a.max_calls, a.unstick, a.temperature)
         with open(a.out, "a") as f:
             for fut in asyncio.as_completed([run(t) for t in tasks]):
                 try:
@@ -316,6 +316,7 @@ if __name__ == "__main__":
     ap.add_argument("--base", help="tokenizer/base model when --model is a LoRA name")
     ap.add_argument("--max_calls", type=int, default=8)
     ap.add_argument("--max_new", type=int, default=1536)
+    ap.add_argument("--temperature", type=float, default=0, help="vllm: sampling temperature (self-play attempts)")
     ap.add_argument("--unstick", action="store_true",
                     help="don't rerun a repeated or no-op change; ask for step-by-step reasoning; sample the next turn")
     ap.add_argument("--teacher_think", action="store_true",
