@@ -44,6 +44,8 @@ ap.add_argument("--task", default="spero", choices=["spero", "code"],
                 help="code: coding-agent traces (CODE_SYSTEM, fenced actions; keyed by task id, not prompt text)")
 ap.add_argument("--self_traces", help="code: the student's own attempts (comma list); keeps one *recovery* per task "
                 "(a change, failing tests, a different change, pass); its wasted moves stay in context, loss off")
+ap.add_argument("--mask_wrong", action="store_true",
+                help="--self_traces: also mask changes the next test run proved wrong (learn the recovery, not the mistake)")
 ap.add_argument("--epochs", type=float, default=2)
 ap.add_argument("--lr", type=float, default=1e-4)
 ap.add_argument("--rank", type=int, default=32)
@@ -100,6 +102,20 @@ def is_recovery(r):
     return False
 
 
+def wrong_attempts(r):
+    """indices of changes the next test run proved wrong: learning them taught v5 careless first guesses that the
+    tests would catch (single-shot HumanEval+MBPP 79.8 -> 74.3); only the recovery after them should be learned"""
+    out, pending = set(), None
+    for i, s in enumerate(r["steps"]):
+        if s.get("tool") in ("edit", "write") and str(s.get("result", "")).startswith(("edited", "wrote")):
+            pending = i
+        elif s.get("tool") == "bash" and pending is not None and "pytest" in s.get("arg", ""):
+            if "[exit code" in str(s.get("result", "")):
+                out.add(pending)
+            pending = None
+    return out
+
+
 if args.self_traces:
     mine = defaultdict(list)
     for path in args.self_traces.split(","):
@@ -108,9 +124,12 @@ if args.self_traces:
             if keep(r) and is_recovery(r):
                 mine[r["id"]].append(r)
     for rs in mine.values():
-        traces.append(min(rs, key=lambda r: r["turns"]))
+        r = min(rs, key=lambda r: r["turns"])
+        r["masked"] = sorted(wrong_attempts(r)) if args.mask_wrong else []
+        traces.append(r)
     print(f"+ {len(mine)} self-generated recovery traces "
-          f"({sum(wasted(s) for rs in mine.values() for s in min(rs, key=lambda r: r['turns'])['steps'])} wasted moves masked)")
+          f"({sum(wasted(s) for rs in mine.values() for s in min(rs, key=lambda r: r['turns'])['steps'])} wasted moves, "
+          f"{sum(len(r.get('masked', [])) for r in traces)} wrong attempts masked)")
 
 tok = AutoTokenizer.from_pretrained(args.model)
 TPL = {"enable_thinking": False}  # hybrid Qwen3 templates; ignored by templates that don't use it
@@ -159,7 +178,7 @@ def encode(r):
     text = tok.apply_chat_template(msgs, tokenize=False, add_generation_prompt=False, **TPL)
     enc = tok(text, add_special_tokens=False, return_offsets_mapping=True)
     spans, i = [], 0
-    trained = [not wasted(s) for s in r["steps"]]
+    trained = [not wasted(s) and i not in r.get("masked", ()) for i, s in enumerate(r["steps"])]
     while True:
         a = text.find("<|im_start|>assistant\n", i)
         if a < 0:
@@ -181,14 +200,14 @@ def encode_per_turn(r):
     """[(ids, labels)] one per assistant turn: inference-identical prompt + that turn's reply"""
     msgs = [{"role": "system", "content": SYSTEM}, {"role": "user", "content": r["q"]}]
     out = []
-    for s in r["steps"]:
+    for i, s in enumerate(r["steps"]):
         prompt = tok.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True, **TPL)
         reply = trim_thought(s["text"], args.max_thought_chars, s.get("think"))
         p_ids = tok(prompt, add_special_tokens=False)["input_ids"]
         r_ids = tok(reply + "<|im_end|>", add_special_tokens=False)["input_ids"]
         ids = (p_ids + r_ids)[-args.max_len:]
         labels = ([-100] * len(p_ids) + r_ids)[-args.max_len:]
-        if not wasted(s):
+        if not wasted(s) and i not in r.get("masked", ()):
             out.append((ids, labels))
         msgs.append({"role": "assistant", "content": reply})
         if s.get("result") is not None:
