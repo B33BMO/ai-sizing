@@ -1,0 +1,50 @@
+#!/bin/bash
+. /usr/local/lib/opsd/lib.sh
+args=(); for a in "$@"; do case $a in -*) ;; *) args+=("$a");; esac; done
+cmd=${args[0]:-list-units}; units=("${args[@]:1}")
+case $cmd in
+  status)
+    [ ${#units[@]} -eq 0 ] && { echo "● $(hostname)"; echo "    State: running"; echo "     Jobs: 0 queued"; exit 0; }
+    rc=0
+    for x in "${units[@]}"; do u=$(unit_name $x)
+      [ -f $U/$u ] || { echo "Unit $u.service could not be found."; rc=4; continue; }
+      ( . $U/$u; p=$(pid_of $u)
+        echo "● $u.service - $DESCRIPTION"
+        echo "     Loaded: loaded (/lib/systemd/system/$u.service; enabled; vendor preset: enabled)"
+        if [ -n "$p" ]; then
+          echo "     Active: active (running) since $(cat $S/since.$u)"
+          echo "   Main PID: $p (${EXEC##*/})"
+          echo "      Tasks: ${TASKS:-4} (limit: 4915)"
+          echo "     Memory: ${MEM:-61.2M}"
+        else
+          echo "     Active: inactive (dead) since $(cat $S/stopped.$u 2>/dev/null || now)"
+        fi
+        echo; [ -n "$LOG" ] && tail -n 10 "$LOG" 2>/dev/null | sed "s/^/$(hostname) ${EXEC##*/}[${p:-0}]: /" )
+      [ -n "$(pid_of $u)" ] || rc=3
+    done; exit $rc;;
+  start|stop|restart|try-restart|reload-or-restart|kill)
+    for x in "${units[@]}"; do u=$(unit_name $x)
+      [ -f $U/$u ] || { echo "Failed to $cmd $u.service: Unit $u.service not found." >&2; exit 5; }
+      act systemctl $cmd $u
+      case $cmd in start) start_unit $u;;
+        stop|kill) stop_unit $u; now > $S/stopped.$u;;
+        *) stop_unit $u; start_unit $u;; esac
+    done;;
+  reload)
+    for x in "${units[@]}"; do u=$(unit_name $x)
+      [ -f $U/$u ] || { echo "Failed to reload $u.service: Unit $u.service not found." >&2; exit 5; }
+      ( . $U/$u; [ "$RELOAD" = yes ] ) || { echo "Failed to reload $u.service: Job type reload is not applicable for unit $u.service." >&2; exit 1; }
+      act systemctl reload $u
+      [ $u = sshd ] && { stop_unit sshd; start_unit sshd; }
+    done;;
+  is-active) for x in "${units[@]}"; do [ -n "$(pid_of $(unit_name $x))" ] && echo active || { echo inactive; exit 3; }; done;;
+  is-enabled) for x in "${units[@]}"; do echo enabled; done;;
+  enable|disable|daemon-reload|mask|unmask) act systemctl $cmd "${units[@]}";;
+  reboot|poweroff|halt) act reboot; echo "Connection to $(hostname) closed by remote host.";;
+  list-units|list-unit-files|--failed)
+    echo "  UNIT                      LOAD   ACTIVE SUB     DESCRIPTION"
+    for f in $U/*; do u=${f##*/}; ( . $f; [ -n "$(pid_of $u)" ] && st="active running" || st="inactive dead   "
+      printf "  %-25s loaded %s %s\n" "$u.service" "$st" "$DESCRIPTION" ); done
+    echo; echo "$(ls $U | wc -l) loaded units listed.";;
+  *) echo "Unknown command verb $cmd." >&2; exit 1;;
+esac

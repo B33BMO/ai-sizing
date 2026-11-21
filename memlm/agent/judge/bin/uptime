@@ -1,0 +1,3 @@
+#!/bin/bash
+n=$(cat /var/lib/opsd/sessions 2>/dev/null | wc -l)
+echo " $(date +%H:%M:%S) up 18 days,  3:52,  $n user$([ "$n" = 1 ] || echo s),  load average: ${LOAD:-0.41, 0.38, 0.35}"

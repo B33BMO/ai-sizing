@@ -10,6 +10,11 @@ tool service, LAN-only.
   {"op": "write", "id": "...", "path": "x.py", "content": "..."} -> {"ok": true}
   {"op": "read", "id": "...", "path": "x.py"}          -> {"ok": true, "content": "..."}  (untruncated, for edits)
   {"op": "destroy", "id": "..."}                       -> {"ok": true}
+
+  Judgment eval (agent/judge_agent.py): {"op": "create", "profile": "judge", "files": {"/abs/path": ...}, "setup": "sh"}
+  starts a simulated server instead (image memlm-judge, agent/judge/): still no network and capped, but root with a
+  writable root filesystem and a few capabilities (kill, chown, setuid...) so services, users and files can be faked.
+  "files" are written, then "setup" runs (bash, 120 s); exec runs bash as root in /root; exec takes "timeout" (<=120).
 """
 import base64
 import json
@@ -27,7 +32,10 @@ MAX_BOXES = int(os.environ.get("SB_MAX", "32"))
 IDLE_S = 600
 EXEC_TIMEOUT = 20
 MAX_OUT = 4000
+JUDGE_IMAGE = os.environ.get("SB_JUDGE_IMAGE", "memlm-judge:latest")
+JUDGE_BUILD_DIR = os.path.expanduser("~/memlm-spero/judge")
 boxes = {}  # id -> last-used time
+profiles = {}  # id -> "code" | "judge"
 lock = threading.Lock()
 build_lock = threading.Lock()
 
@@ -36,17 +44,18 @@ def docker(*args, timeout=30, stdin=None):
     return subprocess.run(["docker", *args], capture_output=True, timeout=timeout, input=stdin)
 
 
-def create(files):
+def create(files, profile="code", setup=None):
     with lock:
         if len(boxes) >= MAX_BOXES:
             raise RuntimeError(f"sandbox limit reached ({MAX_BOXES})")
         bid = "memlm-sb-" + uuid.uuid4().hex[:12]
         boxes[bid] = time.time()
+        profiles[bid] = profile
     for attempt in range(3):  # `docker run` can fail silently when srv is busy: retry with backoff
         if attempt == 0 or b"Unable to find image" in r.stderr:
             with build_lock:
-                ensure_image()
-        r = _run(bid)
+                ensure_image(*((JUDGE_IMAGE, JUDGE_BUILD_DIR) if profile == "judge" else (IMAGE, BUILD_DIR)))
+        r = _run_judge(bid) if profile == "judge" else _run(bid)
         if r.returncode == 0:
             break
         docker("rm", "-f", bid)
@@ -54,21 +63,27 @@ def create(files):
     if r.returncode != 0:
         with lock:
             boxes.pop(bid, None)
+            profiles.pop(bid, None)
         raise RuntimeError(f"docker run failed: {r.stderr.decode()[-300:] or 'no message'}")
     for path, content in files.items():
         write(bid, path, content)
-    print(f"{time.strftime('%H:%M:%S')} create {bid}", flush=True)
+    if setup:
+        out, code = execute(bid, setup, timeout=120)
+        if code != 0:
+            destroy(bid, "setup failed")
+            raise RuntimeError(f"setup failed ({code}): {out[-500:]}")
+    print(f"{time.strftime('%H:%M:%S')} create {bid} ({profile})", flush=True)
     return bid
 
 
 BUILD_DIR = os.path.expanduser("~/memlm-spero/sandbox")  # Dockerfile for IMAGE
 
 
-def ensure_image():
+def ensure_image(image=IMAGE, build_dir=BUILD_DIR):
     """images on srv have been pruned before (docker image/system prune -a): rebuild if missing"""
-    if docker("image", "inspect", IMAGE).returncode != 0:
-        print(f"{time.strftime('%H:%M:%S')} image {IMAGE} missing: rebuilding", flush=True)
-        r = docker("build", "-q", "-t", IMAGE, BUILD_DIR, timeout=900)
+    if docker("image", "inspect", image).returncode != 0:
+        print(f"{time.strftime('%H:%M:%S')} image {image} missing: rebuilding", flush=True)
+        r = docker("build", "-q", "-t", image, build_dir, timeout=900)
         if r.returncode != 0:
             raise RuntimeError(f"rebuild failed: {r.stderr.decode()[-300:]}")
 
@@ -82,8 +97,23 @@ def _run(bid):
                timeout=60)
 
 
+def _run_judge(bid):
+    caps = [a for c in ("CHOWN", "DAC_OVERRIDE", "FOWNER", "KILL", "SETUID", "SETGID",
+                                         "NET_BIND_SERVICE", "SYS_PTRACE")
+            for a in ("--cap-add", c)]
+    return docker("run", "-d", "--rm", "--name", bid, "--hostname", "web01", "--network", "none",
+                  "--tmpfs", "/data:rw,exec,size=256m", "--tmpfs", "/tmp:rw,exec,size=64m", "--tmpfs", "/run:rw,size=8m",
+                  "--user", "0:0", "--cap-drop", "ALL", *caps, "--security-opt", "no-new-privileges",
+                  "--memory", "768m", "--memory-swap", "768m", "--cpus", "1", "--pids-limit", "256",
+                  "-w", "/root", "-e", "HOME=/root", "-e", "TZ=UTC", "-e", "SIM_EXIT_AFTER=3600", JUDGE_IMAGE,
+                  "bash", "-c", "exec -a /sbin/init /usr/local/lib/opsd/simd", timeout=60)
+
+
 def write(bid, path, content):
-    if path.startswith("/") or ".." in path.split("/"):
+    if profiles.get(bid) == "judge":  # a whole simulated server: absolute paths allowed (still inside the box)
+        if not path.startswith("/"):
+            path = "/root/" + path
+    elif path.startswith("/") or ".." in path.split("/"):
         raise ValueError("paths must be relative to /work")
     b64 = base64.b64encode(content.encode()).decode()
     cmd = f'mkdir -p "$(dirname "{path}")" && base64 -d > "{path}"'
@@ -93,7 +123,10 @@ def write(bid, path, content):
 
 
 def read(bid, path):
-    if path.startswith("/") or ".." in path.split("/"):
+    if profiles.get(bid) == "judge":
+        if not path.startswith("/"):
+            path = "/root/" + path
+    elif path.startswith("/") or ".." in path.split("/"):
         raise ValueError("paths must be relative to /work")
     r = docker("exec", bid, "head", "-c", "200000", path)
     if r.returncode != 0:
@@ -101,15 +134,16 @@ def read(bid, path):
     return r.stdout.decode(errors="replace")
 
 
-def execute(bid, cmd):
+def execute(bid, cmd, timeout=EXEC_TIMEOUT):
+    shell = "bash" if profiles.get(bid) == "judge" else "sh"
     try:
-        r = docker("exec", bid, "timeout", "-k", "2", str(EXEC_TIMEOUT), "sh", "-c", cmd, timeout=EXEC_TIMEOUT + 10)
+        r = docker("exec", bid, "timeout", "-k", "2", str(timeout), shell, "-c", cmd, timeout=timeout + 10)
         out = (r.stdout + r.stderr).decode(errors="replace")
         code = r.returncode
     except subprocess.TimeoutExpired:
         out, code = "[timed out]", 124
     if code == 124 and not out:
-        out = f"[timed out after {EXEC_TIMEOUT}s]"
+        out = f"[timed out after {timeout}s]"
     if len(out) > MAX_OUT:
         out = out[:MAX_OUT // 2] + "\n[...truncated...]\n" + out[-MAX_OUT // 2:]
     return out, code
@@ -119,20 +153,21 @@ def destroy(bid, why="client"):
     print(f"{time.strftime('%H:%M:%S')} destroy {bid} ({why})", flush=True)
     with lock:
         boxes.pop(bid, None)
+        profiles.pop(bid, None)
     docker("rm", "-f", bid)
 
 
 def handle(req):
     op = req.get("op")
     if op == "create":
-        return {"ok": True, "id": create(req.get("files", {}))}
+        return {"ok": True, "id": create(req.get("files", {}), req.get("profile", "code"), req.get("setup"))}
     bid = req.get("id", "")
     with lock:
         if bid not in boxes:
             raise KeyError("unknown sandbox")
         boxes[bid] = time.time()
     if op == "exec":
-        text, code = execute(bid, req["cmd"])
+        text, code = execute(bid, req["cmd"], min(int(req.get("timeout", EXEC_TIMEOUT)), 120))
         return {"ok": True, "text": text, "code": code}
     if op == "write":
         write(bid, req["path"], req["content"])

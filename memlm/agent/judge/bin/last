@@ -1,0 +1,5 @@
+#!/bin/bash
+f=/var/lib/opsd/sessions
+[ -s $f ] && awk '{gsub("_"," ",$4); printf "%-8s %-12s %-16s %s   still logged in\n", $1, $2, $3, $4}' $f
+cat /var/lib/opsd/lastlog 2>/dev/null
+echo; echo "wtmp begins $(cat /var/lib/opsd/boot 2>/dev/null || echo 'Mon Nov  2 04:11:02 2026')"

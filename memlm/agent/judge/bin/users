@@ -1,0 +1,2 @@
+#!/bin/bash
+f=/var/lib/opsd/sessions; [ -s $f ] && awk '{printf "%s%s", (NR>1?" ":""), $1} END{print ""}' $f; exit 0

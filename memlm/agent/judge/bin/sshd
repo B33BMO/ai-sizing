@@ -1,0 +1,10 @@
+#!/bin/bash
+c=/etc/ssh/sshd_config
+port=$(awk 'tolower($1)=="port"{p=$2} END{print p?p:22}' $c)
+case "$*" in
+  *-t*) grep -qE '^\s*[Pp]ort\s+[0-9]+\s*$|^\s*#' $c || true
+        bad=$(grep -nE '^\s*[Pp]ort' $c | grep -vE '^[0-9]+:\s*[Pp]ort\s+[0-9]+\s*$' | head -1)
+        [ -n "$bad" ] && { echo "/etc/ssh/sshd_config line ${bad%%:*}: Badly formatted port number."; exit 255; }; exit 0;;
+  *-T*) echo "port $port"; echo "addressfamily any"; echo "listenaddress [::]:$port"; echo "listenaddress 0.0.0.0:$port"; echo "permitrootlogin without-password"; echo "passwordauthentication no";;
+  *) echo "sshd re-exec requires execution with an absolute path"; exit 1;;
+esac

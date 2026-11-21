@@ -1,0 +1,4 @@
+#!/bin/bash
+echo "$(date +%s) shutdown $*" >> /var/lib/opsd/actions.log
+[ "$1" = -c ] && { echo "Shutdown cancelled."; exit 0; }
+echo "Broadcast message from root@$(hostname): The system will shutdown now!"

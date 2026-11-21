@@ -1,0 +1,6 @@
+#!/bin/bash
+# sessions file: user tty from login_time idle what
+f=/var/lib/opsd/sessions
+case "$1" in -b) echo "         system boot  $(cat /var/lib/opsd/boot 2>/dev/null || echo '2026-11-02 04:11')"; exit;; -q) awk '{printf "%s ",$1} END{print "\n# users=" NR}' $f 2>/dev/null; exit;; esac
+[ -s $f ] && awk '{gsub("_"," ",$4); printf "%-8s %-12s %s (%s)\n", $1, $2, $4, $3}' $f
+exit 0

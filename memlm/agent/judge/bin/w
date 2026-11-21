@@ -1,0 +1,5 @@
+#!/bin/bash
+uptime
+echo "USER     TTY      FROM             LOGIN@   IDLE   JCPU   PCPU WHAT"
+f=/var/lib/opsd/sessions; [ -s $f ] && awk '{w=""; for(i=6;i<=NF;i++) w=w (i>6?" ":"") $i; printf "%-8s %-8s %-16s %-8s %-6s 0.04s  0.01s %s\n", $1, $2, $3, substr($4,12,5), $5, w}' $f
+exit 0

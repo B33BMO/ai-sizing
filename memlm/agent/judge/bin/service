@@ -1,0 +1,3 @@
+#!/bin/bash
+[ "$1" = --status-all ] && { exec systemctl list-units; }
+exec systemctl "${2:-status}" "$1"
