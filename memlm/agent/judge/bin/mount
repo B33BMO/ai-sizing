@@ -1,0 +1,9 @@
+#!/bin/bash
+[ $# -gt 0 ] && { echo "mount: only root can do that" >&2; exit 1; }
+cat <<'M'
+/dev/sda1 on / type ext4 (rw,relatime,errors=remount-ro)
+/dev/sdb1 on /data type ext4 (rw,relatime)
+tmpfs on /run type tmpfs (rw,nosuid,nodev,size=8192k,mode=755)
+tmpfs on /tmp type tmpfs (rw,nosuid,nodev,size=65536k)
+proc on /proc type proc (rw,nosuid,nodev,noexec,relatime)
+M

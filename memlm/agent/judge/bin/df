@@ -1,0 +1,16 @@
+#!/bin/bash
+# df stand-in: /data is a tmpfs in the box but a disk on the "server"; the box's overlay root is shown as a plain disk
+human=0; typ=0
+for a in "$@"; do [[ $a == --* ]] && { [[ $a == --human-readable || $a == --si ]] && human=1; [[ $a == --print-type ]] && typ=1; continue; }
+  [[ $a == -* ]] && { [[ $a == *h* || $a == *H* ]] && human=1; [[ $a == *T* ]] && typ=1; }; done
+/bin/df "$@" | awk -v h=$human -v t=$typ '
+  function out(fs, ty, a, b, c, p, m) {
+    w = h ? 5 : 10
+    if (t) printf "%-15s %-6s %" w "s %" w "s %" w "s %4s %s\n", fs, ty, a, b, c, p, m
+    else   printf "%-15s %" w "s %" w "s %" w "s %4s %s\n", fs, a, b, c, p, m }
+  NR == 1 { if (t) out("Filesystem", "Type", $3, $4, $5, $6, "Mounted on"); else out("Filesystem", "", $2, $3, $4, $5, "Mounted on"); next }
+  { m = $NF; o = t ? 1 : 0; fs = $1; ty = t ? $2 : ""; a = $(2+o); b = $(3+o); c = $(4+o); p = $(5+o) }
+  m == "/" { if (h) out("/dev/sda1", "ext4", "40G", "13G", "25G", "34%", "/"); else out("/dev/sda1", "ext4", 41152736, 13631488, 25424384, "35%", "/"); next }
+  m ~ /^\/(etc\/|dev|sys|proc)/ { next }
+  m == "/data" { fs = "/dev/sdb1"; ty = "ext4" }
+  { out(fs, ty, a, b, c, p, m) }'
